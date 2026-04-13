@@ -1,0 +1,65 @@
+workload:
+  rank_sizes:
+    {% set VOCAB_SIZE = VOCAB_SIZE | default(32000) %}
+    {% set N_DOCS = N_DOCS | default(1024) %}
+    {% set T_TOKENS = T_TOKENS | default(512) %}
+    {% set K_DOCS = K_DOCS | default(10) %}
+    V: {{VOCAB_SIZE}}     # vocab size
+    N: {{N_DOCS}}         # number of documents in corpus
+    T: {{T_TOKENS}}       # query token length
+    S: {{T_TOKENS}}      
+    D: 768                # embedding dimension (d ~ d_k ~ d_v)
+    DK: 768               # query/key projection dimension
+    DV: 768               # value projection dimension
+    K: {{K_DOCS}}         # top-k documents retrieved
+  bits_per_value: {All: 8}
+  persistent_tensors: weight - Intermediates
+  einsums:
+  # X_tok is a one-hot query token matrix; E is the embedding weight matrix.
+  # X_tok is an external input (not an intermediate), so override the default
+  # `Inputs & Intermediates` rule with an explicit input rename.
+  - einsum: "X[t, d] = X_tok[t, v] * E[v, d]"
+    renames: {input: X_tok, weight: E}
+
+  - einsum: "Q[t, dk] = X[t, d] * W_Q[d, dk]"
+    renames: {input: X, weight: W_Q}
+  - einsum: "K[t, dk] = X[t, d] * W_K[d, dk]"
+    renames: {input: X, weight: W_K}
+  - einsum: "V[t, dv] = X[t, d] * W_V[d, dv]"
+    renames: {input: X, weight: W_V}
+  - einsum: "A[t, s] = Q[t, dk] * K[T: s, dk]"
+    renames: {input: Q, weight: K}
+
+  # P[t, s] = softmax_s(A[t, s]), check modeling on this...
+  - einsum: "P[t, s] = A[t, s]" 
+    is_copy_operation: True
+
+  - einsum: "H[t, dv] = P[t, s] * V[T: s, dv]"
+    renames: {input: P, weight: V}
+
+  # Z_Q[dv] = H[0, dv], extract the CLS token (t=0) as the query embedding
+  # Modelled as a copy over the dv dimension with T fixed to index 0.
+  - einsum: "Z_Q[dv] = H[t, dv]"
+    is_copy_operation: True
+
+  # similarity
+  - einsum: "S_score[n] = Z_D[n, d] * Z_Q[DV: d]"
+    renames: {input: Z_Q, weight: Z_D}
+
+  # TK[n, t] = get_top_k(S_score[n], k, D[n, t])
+  - einsum: "TK[n, t] = S_score[n] * D[n, t]" # figure out sparse masking in code
+    renames: {input: S_score, weight: D}
+
+renames:
+  einsums:
+  - name: default
+    tensor_accesses:
+    - name: input
+      source: Inputs & Intermediates if len(All) == 3 else Inputs
+      expected_count: 1
+    - name: output
+      source: Outputs
+      expected_count: 1
+    - name: weight
+      source: ~(input | output)
+      expected_count: 1 if len(All) == 3 else 0
