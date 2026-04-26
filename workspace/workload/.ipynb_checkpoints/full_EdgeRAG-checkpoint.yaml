@@ -12,17 +12,17 @@ workload:
   #   3. Decoder (Sheared-LLaMA-2.7B): [query || retrieved tokens] -> generated tokens
 
   rank_sizes:
-    {% set N_TOKENS     = N_TOKENS     | default(512)  %}
-    {% set N_DOCS       = N_DOCS       | default(1024) %}
-    {% set K            = K            | default(10)   %}   # number of retrieved docs
-    {% set L            = L            | default(512)  %}   # tokens per doc
-    {% set BATCH_SIZE   = BATCH_SIZE   | default(1)    %}
+    {% set N_TOKENS = N_TOKENS | default(512) %}
+    {% set N_DOCS = N_DOCS | default(1024)%}
+    {% set K = K | default(10) %}   # number of retrieved docs
+    {% set L = L | default(512) %}   # tokens per doc
+    {% set BATCH_SIZE = BATCH_SIZE | default(1) %}
     {% set INPUT_TOKENS = INPUT_TOKENS | default(N_TOKENS + K * L) %}
 
     # -----------------------------------------------------------------------
     # Shared / Retrieval dimensions
     # -----------------------------------------------------------------------
-    batch:        {{BATCH_SIZE}}     # batch size
+    batch: {{BATCH_SIZE}}     # batch size
     num_docs:     {{N_DOCS}}         # total documents in FAISS index
     top_k_docs:   {{K}}              # number of documents retrieved per query
     doc_len:      {{L}}              # tokens per document
@@ -43,9 +43,9 @@ workload:
     enc_kv_pos:       {{N_TOKENS}}   # key/value position axis (same size as enc_seq_len)
     enc_num_heads:    12             # number of attention heads
     enc_head_dim:     64             # dimension per head  (768 / 12)
-    enc_hidden:       {{12*64}}      # hidden dimension = 768
-    enc_ffn_mid:      {{4*12*64}}    # FFN intermediate dimension = 3072
-    enc_embed_dim:    {{12*64}}      # sentence embedding output dimension = 768
+    enc_hidden:       768      # hidden dimension = 768
+    enc_ffn_mid:      3072    # FFN intermediate dimension = 3072
+    enc_embed_dim:    768      # sentence embedding output dimension = 768
 
     # -----------------------------------------------------------------------
     # Decoder: Sheared-LLaMA-2.7B
@@ -62,7 +62,7 @@ workload:
     dec_kv_pos:       {{INPUT_TOKENS}}  # key/value position axis (same size as dec_seq_len)
     dec_num_heads:    20                # number of attention heads
     dec_head_dim:     128               # dimension per head  (2560 / 20)
-    dec_hidden:       {{20*128}}        # hidden dimension = 2560
+    dec_hidden:       2560        # hidden dimension = 2560
     dec_ffn_mid:      6912              # FFN intermediate dim (SwiGLU gate & up projections)
     dec_vocab:        32000             # vocabulary size
 
@@ -97,10 +97,12 @@ workload:
     # --- Attention scores: (batch, query_pos, key_pos, head) ---
     # Contracts over enc_head_dim.
     - einsum: "enc_attn_scores[batch, enc_seq_len, enc_kv_pos, enc_num_heads]  = enc_queries[batch, enc_seq_len, enc_num_heads, enc_head_dim] * enc_keys[batch, ENC_SEQ_LEN: enc_kv_pos, enc_num_heads, enc_head_dim]"
+      renames: {input: enc_queries}
     - einsum: "enc_attn_weights[batch, enc_seq_len, enc_kv_pos, enc_num_heads] = enc_attn_scores[batch, enc_seq_len, enc_kv_pos, enc_num_heads]"
 
     # --- Weighted value aggregation ---
     - einsum: "enc_attn_out[batch, enc_seq_len, enc_num_heads, enc_head_dim] = enc_attn_weights[batch, enc_seq_len, enc_kv_pos, enc_num_heads] * enc_values[batch, ENC_SEQ_LEN: enc_kv_pos, enc_num_heads, enc_head_dim]"
+      renames: {input: enc_attn_weights}
 
     # --- Output projection ---
     # enc_W_out shape: (enc_num_heads, enc_head_dim, enc_hidden) = (12, 64, 768)
@@ -110,8 +112,10 @@ workload:
     # enc_W_ffn_up   shape: (enc_hidden, enc_ffn_mid)    = (768, 3072)  expand
     # enc_W_ffn_down shape: (enc_ffn_mid, enc_embed_dim) = (3072, 768)  contract
     - einsum: "enc_ffn_hidden[batch, enc_seq_len, enc_ffn_mid] = enc_attn_proj[batch, enc_seq_len, enc_hidden] * enc_W_ffn_up[enc_hidden, enc_ffn_mid]"
+    - einsum: "enc_ffn_hidden_act[batch, enc_seq_len, enc_ffn_mid] = enc_ffn_hidden[batch, enc_seq_len, enc_ffn_mid]"
+      is_copy_operation: True
+    # enc_ffn_hidden_act is GELU(enc_ffn_hidden) — elementwise, no weight matrix
     - einsum: "enc_ffn_out[batch, enc_seq_len, enc_embed_dim]  = enc_ffn_hidden_act[batch, enc_seq_len, enc_ffn_mid] * enc_W_ffn_down[enc_ffn_mid, enc_embed_dim]"
-    # enc_ffn_hidden_act is GELU(enc_ffn_hidden) — elementwise, no weight matrix.
 
     # =======================================================================
     # CLS POOLING
@@ -143,12 +147,16 @@ workload:
 
     # =======================================================================
     # DOCUMENT GATHER
+    # Models the memory traffic of fetching K documents from the corpus.
+
     # Gather the K retrieved documents from the token corpus.
     # corpus_tokens[num_docs, doc_len]: token IDs for all documents.
     # topk_tokens[batch, top_k_docs, doc_len]: token IDs for retrieved docs only.
     # Arithmetic cost = 0; memory cost = top_k_docs * doc_len reads per batch.
     # =======================================================================
-    - einsum: "topk_tokens[batch, top_k_docs, doc_len] = corpus_tokens[num_docs, doc_len]"
+    # - einsum: "topk_tokens[batch, top_k_docs, doc_len] = corpus_tokens[num_docs, doc_len]"
+    #   is_copy_operation: True
+    - einsum: "topk_tokens[batch, top_k_docs, doc_len] = corpus_tokens[num_docs, doc_len] * topk_doc_ids[batch, top_k_docs]"
       is_copy_operation: True
 
     # =======================================================================

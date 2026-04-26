@@ -102,7 +102,7 @@ workload:
 renames:
   einsums:
     - name: default
-      tensor_axesses:
+      tensor_accesses:
         - name: input
           source: Inputs & Intermediates if len(All) == 3 else Inputs
           expected_count: 1
