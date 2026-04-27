@@ -7,9 +7,9 @@ workload:
   #                                             shape (1024, 768), stored in FAISS
   #
   # Pipeline:
-  #   1. Encoder (gte-base-en-v1.5): query tokens -> CLS vector (768-dim)
+  #   1. Encoder (gte-base-en-v1.5, 137 million params): query tokens -> CLS vector (768-dim)
   #   2. FAISS retrieval: CLS . corpus_embeddings -> top-K doc scores -> select K docs
-  #   3. Decoder (Sheared-LLaMA-2.7B): [query || retrieved tokens] -> generated tokens
+  #   3. Decoder (Sheared-LLaMA-2.7B, 2.7 billion params): [query || retrieved tokens] -> generated tokens
 
   rank_sizes:
     {% set N_TOKENS = N_TOKENS | default(512) %}
@@ -178,10 +178,12 @@ workload:
     # --- Causal attention scores: contracts over dec_head_dim ---
     # Causal mask applied implicitly (each token only attends to prior positions).
     - einsum: "dec_attn_scores[batch, dec_seq_len, dec_kv_pos, dec_num_heads]  = dec_queries[batch, dec_seq_len, dec_num_heads, dec_head_dim] * dec_keys[batch, DEC_SEQ_LEN: dec_kv_pos, dec_num_heads, dec_head_dim]"
+      renames: {input: dec_queries}
     - einsum: "dec_attn_weights[batch, dec_seq_len, dec_kv_pos, dec_num_heads] = dec_attn_scores[batch, dec_seq_len, dec_kv_pos, dec_num_heads]"
 
     # --- Weighted value aggregation ---
     - einsum: "dec_attn_out[batch, dec_seq_len, dec_num_heads, dec_head_dim] = dec_attn_weights[batch, dec_seq_len, dec_kv_pos, dec_num_heads] * dec_values[batch, DEC_SEQ_LEN: dec_kv_pos, dec_num_heads, dec_head_dim]"
+      renames: {input: dec_attn_weights}
 
     # --- Output projection ---
     # dec_W_out shape: (dec_num_heads, dec_head_dim, dec_hidden) = (20, 128, 2560)
@@ -205,6 +207,7 @@ workload:
     - einsum: "dec_ffn_gate_act[batch, dec_seq_len, dec_ffn_mid] = dec_ffn_gate[batch, dec_seq_len, dec_ffn_mid]"    # dec_ffn_gate_act = SiLU(dec_ffn_gate) — elementwise, no weight matrix.
       is_copy_operation: True
     - einsum: "dec_ffn_swiglu[batch, dec_seq_len, dec_ffn_mid] = dec_ffn_gate_act[batch, dec_seq_len, dec_ffn_mid] * dec_ffn_up[batch, dec_seq_len, dec_ffn_mid]"
+      renames: {input: dec_ffn_gate_act}
       # is_copy_operation: True
       # Elementwise multiply of two (batch, dec_seq_len, dec_ffn_mid) tensors.
       # No weight matrix; flagged as copy since there is no reduction dimension.
@@ -217,7 +220,6 @@ workload:
     # In standard LLaMA this weight is tied to dec_W_embed; modelled separately.
     # =======================================================================
     # - einsum: "logits[batch, dec_seq_len, dec_vocab] = dec_ffn_out[batch, dec_seq_len, dec_hidden] * dec_W_lm_head[dec_hidden, dec_vocab]"
-
 renames:
   einsums:
     - name: default

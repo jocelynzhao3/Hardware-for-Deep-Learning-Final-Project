@@ -1,0 +1,225 @@
+# Rewrote full_EdgeRAG.yaml to try to fit Fusion mapping syntax
+workload:
+  rank_sizes:
+    # Use Jinja2 defaults as defined in your original file
+    {% set N_TOKENS = N_TOKENS | default(512) %}
+    {% set N_DOCS = N_DOCS | default(2_000_000)%}
+    {% set K = K | default(10) %}
+    {% set L = L | default(512) %}
+    {% set BATCH_SIZE = BATCH_SIZE | default(1) %}
+    {% set INPUT_TOKENS = INPUT_TOKENS | default(N_TOKENS + K * L) %}
+
+    BATCH: {{BATCH_SIZE}}
+    NUM_DOCS: {{N_DOCS}}
+    TOP_K_DOCS: {{K}}
+    DOC_LEN: {{L}}
+
+    # Encoder (GTE)
+    ENC_SEQ_LEN: {{N_TOKENS}}
+    # ENC_KV_POS: {{N_TOKENS}}
+    ENC_NUM_HEADS: 12
+    ENC_HEAD_DIM: 64
+    ENC_HIDDEN: 768
+    ENC_FFN_MID: 3072
+    ENC_EMBED_DIM: 768
+
+    # Decoder (Sheared-LLaMA)
+    DEC_SEQ_LEN: {{INPUT_TOKENS}}
+    # DEC_KV_POS: {{INPUT_TOKENS}}
+    DEC_NUM_HEADS: 20
+    DEC_HEAD_DIM: 128
+    DEC_HIDDEN: 2560
+    DEC_FFN_MID: 6912
+    DEC_VOCAB: 32000
+
+  bits_per_value:
+    All: 8
+
+  einsums:
+    # ==========================================
+    # ENCODER DATA MOVEMENT & COMPUTE
+    # ==========================================
+
+    - name: Enc_Input_Load
+      # Explicitly models moving raw input to the encoder's working buffer
+      tensor_accesses:
+        - {name: enc_input_raw, projection: [BATCH, ENC_SEQ_LEN, ENC_HIDDEN]}
+        - {name: enc_input, projection: [BATCH, ENC_SEQ_LEN, ENC_HIDDEN], output: True}
+
+    # --- QKV Projections ---
+    - name: Enc_Query_Proj
+      tensor_accesses:
+        - {name: enc_input, projection: [BATCH, ENC_SEQ_LEN, ENC_HIDDEN]}
+        - {name: enc_W_query, projection: [ENC_NUM_HEADS, ENC_HEAD_DIM, ENC_HIDDEN]}
+        - {name: enc_queries, projection: [BATCH, ENC_SEQ_LEN, ENC_NUM_HEADS, ENC_HEAD_DIM], output: True}
+
+    - name: Enc_Key_Proj
+      tensor_accesses:
+        - {name: enc_input, projection: [BATCH, ENC_SEQ_LEN, ENC_HIDDEN]}
+        - {name: enc_W_key, projection: [ENC_NUM_HEADS, ENC_HEAD_DIM, ENC_HIDDEN]}
+        - {name: enc_keys, projection: [BATCH, ENC_SEQ_LEN, ENC_NUM_HEADS, ENC_HEAD_DIM], output: True}
+
+    - name: Enc_Value_Proj
+      tensor_accesses:
+        - {name: enc_input, projection: [BATCH, ENC_SEQ_LEN, ENC_HIDDEN]}
+        - {name: enc_W_value, projection: [ENC_NUM_HEADS, ENC_HEAD_DIM, ENC_HIDDEN]}
+        - {name: enc_values, projection: [BATCH, ENC_SEQ_LEN, ENC_NUM_HEADS, ENC_HEAD_DIM], output: True}
+
+    - name: Enc_Attention_Scores
+      tensor_accesses:
+        - {name: enc_queries, projection: [BATCH, ENC_SEQ_LEN, ENC_NUM_HEADS, ENC_HEAD_DIM]}
+        - {name: enc_keys, projection: [BATCH, ENC_SEQ_LEN, ENC_NUM_HEADS, ENC_HEAD_DIM]}
+        - {name: enc_attn_scores, projection: [BATCH, ENC_SEQ_LEN, ENC_SEQ_LEN, ENC_NUM_HEADS], output: True}
+
+    # --- Weighted Value Aggregation ---
+    - name: Enc_Attention_Weights
+      tensor_accesses:
+        - {name: enc_attn_scores, projection: [BATCH, ENC_SEQ_LEN, ENC_SEQ_LEN, ENC_NUM_HEADS]}
+        - {name: enc_attn_weights, projection: [BATCH, ENC_SEQ_LEN, ENC_SEQ_LEN, ENC_NUM_HEADS], output: True}
+
+    # --- Weighted Value Aggregation ---
+    - name: Enc_Attention_Out
+      tensor_accesses:
+        - {name: enc_attn_weights, projection: [BATCH, ENC_SEQ_LEN, ENC_SEQ_LEN, ENC_NUM_HEADS]}
+        - {name: enc_values, projection: [BATCH, ENC_SEQ_LEN, ENC_NUM_HEADS, ENC_HEAD_DIM]}
+        - {name: enc_attn_out, projection: [BATCH, ENC_SEQ_LEN, ENC_NUM_HEADS, ENC_HEAD_DIM], output: True}
+
+    # --- Output Projection & FFN ---
+    - name: Enc_Attention_Proj
+      tensor_accesses:
+        - {name: enc_attn_out, projection: [BATCH, ENC_SEQ_LEN, ENC_NUM_HEADS, ENC_HEAD_DIM]}
+        - {name: enc_W_out, projection: [ENC_NUM_HEADS, ENC_HEAD_DIM, ENC_HIDDEN]}
+        - {name: enc_attn_proj, projection: [BATCH, ENC_SEQ_LEN, ENC_HIDDEN], output: True}
+
+    - name: Enc_FFN_Up
+      tensor_accesses:
+        - {name: enc_attn_proj, projection: [BATCH, ENC_SEQ_LEN, ENC_HIDDEN]}
+        - {name: enc_W_ffn_up, projection: [ENC_HIDDEN, ENC_FFN_MID]}
+        - {name: enc_ffn_hidden, projection: [BATCH, ENC_SEQ_LEN, ENC_FFN_MID], output: True}
+
+    - name: Enc_GELU_Activation
+      # Models the movement/traffic of the FFN activation step
+      tensor_accesses:
+        - {name: enc_ffn_hidden, projection: [BATCH, ENC_SEQ_LEN, ENC_FFN_MID]}
+        - {name: enc_ffn_hidden_act, projection: [BATCH, ENC_SEQ_LEN, ENC_FFN_MID], output: True}
+
+    - name: Enc_FFN_Down
+      tensor_accesses:
+        - {name: enc_ffn_hidden_act, projection: [BATCH, ENC_SEQ_LEN, ENC_FFN_MID]}
+        - {name: enc_W_ffn_down, projection: [ENC_FFN_MID, ENC_EMBED_DIM]}
+        - {name: enc_ffn_out, projection: [BATCH, ENC_SEQ_LEN, ENC_EMBED_DIM], output: True}
+
+
+    # ==========================================
+    # RETRIEVAL: DATA MOVEMENT HEAVY
+    # ==========================================
+
+    - name: CLS_Pooling
+      # Models gathering the first token's embedding (768-dim) across the batch
+      tensor_accesses:
+        - {name: enc_ffn_out, projection: [BATCH, ENC_SEQ_LEN, ENC_EMBED_DIM]}
+        - {name: query_embedding, projection: [BATCH, ENC_EMBED_DIM], output: True}
+
+    - name: FAISS_Score_Computation
+      tensor_accesses:
+        - {name: query_embedding, projection: [BATCH, ENC_EMBED_DIM]}
+        - {name: corpus_embeddings, projection: [NUM_DOCS, ENC_EMBED_DIM]}
+        - {name: doc_scores, projection: [BATCH, NUM_DOCS], output: True}
+
+    # - name: Top-K_Selection # removing this, mappign will guarantee sequential execution of document gather 
+    #   tensor_accesses:
+    #     - {name: doc_scores, projection: [BATCH, NUM_DOCS]}
+    #     - {name: topk_index_map, projection: [NUM_DOCS, TOP_K_DOCS]}
+    #     - {name: topk_doc_ids, projection: [BATCH, TOP_K_DOCS], output: True}
+
+    - name: Document_Gather
+      # CRITICAL: Models fetching K docs from the massive corpus_tokens (DRAM)
+      # This is often the primary bottleneck in RAG hardware systems.
+      tensor_accesses:
+        - {name: topk_doc_ids, projection: [BATCH, TOP_K_DOCS]}
+        - {name: corpus_tokens, projection: [TOP_K_DOCS, DOC_LEN]}
+        - {name: topk_tokens, projection: [BATCH, TOP_K_DOCS, DOC_LEN], output: True}
+
+    # ==========================================
+    # DECODER DATA MOVEMENT & COMPUTE
+    # ==========================================
+
+    - name: Decoder_Input_Setup
+      # Models moving retrieved tokens and query into the decoder hidden state
+      tensor_accesses:
+        - {name: topk_tokens, projection: [BATCH, TOP_K_DOCS, DOC_LEN]}
+        - {name: dec_input, projection: [BATCH, DEC_SEQ_LEN, DEC_HIDDEN], output: True}
+
+    # --- QKV Projections ---
+    - name: Dec_Query_Proj
+      tensor_accesses:
+        - {name: dec_input, projection: [BATCH, DEC_SEQ_LEN, DEC_HIDDEN]}
+        - {name: dec_W_query, projection: [DEC_NUM_HEADS, DEC_HEAD_DIM, DEC_HIDDEN]}
+        - {name: dec_queries, projection: [BATCH, DEC_SEQ_LEN, DEC_NUM_HEADS, DEC_HEAD_DIM], output: True}
+
+    - name: Dec_Key_Proj
+      tensor_accesses:
+        - {name: dec_input, projection: [BATCH, DEC_SEQ_LEN, DEC_HIDDEN]}
+        - {name: dec_W_key, projection: [DEC_NUM_HEADS, DEC_HEAD_DIM, DEC_HIDDEN]}
+        - {name: dec_keys, projection: [BATCH, DEC_SEQ_LEN, DEC_NUM_HEADS, DEC_HEAD_DIM], output: True}
+
+    - name: Dec_Values_Proj
+      tensor_accesses:
+        - {name: dec_input, projection: [BATCH, DEC_SEQ_LEN, DEC_HIDDEN]}
+        - {name: dec_W_value, projection: [DEC_NUM_HEADS, DEC_HEAD_DIM, DEC_HIDDEN]}
+        - {name: dec_values, projection: [BATCH, DEC_SEQ_LEN, DEC_NUM_HEADS, DEC_HEAD_DIM], output: True}
+
+    # --- Decoder Attention ---
+    - name: Dec_Attention_Scores
+      tensor_accesses:
+        - {name: dec_queries, projection: [BATCH, DEC_SEQ_LEN, DEC_NUM_HEADS, DEC_HEAD_DIM]}
+        - {name: dec_keys, projection: [BATCH, DEC_SEQ_LEN, DEC_NUM_HEADS, DEC_HEAD_DIM]}
+        - {name: dec_attn_scores, projection: [BATCH, DEC_SEQ_LEN, DEC_SEQ_LEN, DEC_NUM_HEADS], output: True}
+
+    - name: Dec_Attention_Weights
+      tensor_accesses:
+        - {name: dec_attn_scores, projection: [BATCH, DEC_SEQ_LEN, DEC_SEQ_LEN, DEC_NUM_HEADS]}
+        - {name: dec_attn_weights, projection: [BATCH, DEC_SEQ_LEN, DEC_SEQ_LEN, DEC_NUM_HEADS], output: True}
+
+    - name: Dec_Attention_Out
+      tensor_accesses:
+        - {name: dec_attn_weights, projection: [BATCH, DEC_SEQ_LEN, DEC_SEQ_LEN, DEC_NUM_HEADS]}
+        - {name: dec_values, projection: [BATCH, DEC_SEQ_LEN, DEC_NUM_HEADS, DEC_HEAD_DIM]}
+        - {name: dec_attn_out, projection: [BATCH, DEC_SEQ_LEN, DEC_NUM_HEADS, DEC_HEAD_DIM], output: True}
+
+    - name: Dec_Attention_Proj
+      tensor_accesses:
+        - {name: dec_attn_out, projection: [BATCH, DEC_SEQ_LEN, DEC_NUM_HEADS, DEC_HEAD_DIM]}
+        - {name: dec_W_out, projection: [DEC_NUM_HEADS, DEC_HEAD_DIM, DEC_HIDDEN]}
+        - {name: dec_attn_proj, projection: [BATCH, DEC_SEQ_LEN, DEC_HIDDEN], output: True}
+
+    # --- SwiGLU FFN (Main compute blocks) ---
+    - name: Dec_FFN_Gate
+      tensor_accesses:
+        - {name: dec_attn_proj, projection: [BATCH, DEC_SEQ_LEN, DEC_HIDDEN]}
+        - {name: dec_W_ffn_gate, projection: [DEC_HIDDEN, DEC_FFN_MID]}
+        - {name: dec_ffn_gate, projection: [BATCH, DEC_SEQ_LEN, DEC_FFN_MID], output: True}
+
+    - name: Dec_FFN_Up
+      tensor_accesses:
+        - {name: dec_attn_proj, projection: [BATCH, DEC_SEQ_LEN, DEC_HIDDEN]}
+        - {name: dec_W_ffn_up, projection: [DEC_HIDDEN, DEC_FFN_MID]}
+        - {name: dec_ffn_up, projection: [BATCH, DEC_SEQ_LEN, DEC_FFN_MID], output: True}
+
+    - name: Dec_FFN_Gate_Act
+      tensor_accesses:
+        - {name: dec_ffn_up, projection: [BATCH, DEC_SEQ_LEN, DEC_FFN_MID]}
+        - {name: dec_ffn_gate_act, projection: [BATCH, DEC_SEQ_LEN, DEC_FFN_MID], output: True}
+
+    - name: SwiGLU_Elementwise_Mult
+      # Models the SiLU(gate) * up element-wise multiplication
+      tensor_accesses:
+        - {name: dec_ffn_gate_act, projection: [BATCH, DEC_SEQ_LEN, DEC_FFN_MID]}
+        - {name: dec_ffn_up, projection: [BATCH, DEC_SEQ_LEN, DEC_FFN_MID]}
+        - {name: dec_ffn_swiglu, projection: [BATCH, DEC_SEQ_LEN, DEC_FFN_MID], output: True}
+
+    - name: Dec_FFN_Out
+      tensor_accesses:
+        - {name: dec_ffn_swiglu, projection: [BATCH, DEC_SEQ_LEN, DEC_FFN_MID]}
+        - {name: dec_W_ffn_down, projection: [DEC_FFN_MID, DEC_HIDDEN]}
+        - {name: dec_ffn_out, projection: [BATCH, DEC_SEQ_LEN, DEC_HIDDEN], output: True}

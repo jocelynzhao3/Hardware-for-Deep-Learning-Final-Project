@@ -1,0 +1,191 @@
+workload:
+  rank_sizes:
+    # Use Jinja2 defaults as defined in your original file
+    {% set N_TOKENS = N_TOKENS | default(512) %}
+    {% set N_DOCS = N_DOCS | default(2_000_000)%}
+    {% set K = K | default(10) %}
+    {% set L = L | default(512) %}
+    {% set BATCH_SIZE = BATCH_SIZE | default(1) %}
+    {% set INPUT_TOKENS = INPUT_TOKENS | default(N_TOKENS + K * L) %}
+
+    BATCH: {{BATCH_SIZE}}
+    NUM_DOCS: {{N_DOCS}}
+    TOP_K_DOCS: {{K}}
+    DOC_LEN: {{L}}
+
+    # Encoder (GTE)
+    ENC_SEQ_LEN: {{N_TOKENS}}
+    # ENC_KV_POS: {{N_TOKENS}}
+    ENC_NUM_HEADS: 12
+    ENC_HEAD_DIM: 64
+    ENC_HIDDEN: 768
+    ENC_FFN_MID: 3072
+    ENC_EMBED_DIM: 768
+
+    # Decoder (Sheared-LLaMA)
+    DEC_SEQ_LEN: {{INPUT_TOKENS}}
+    # DEC_KV_POS: {{INPUT_TOKENS}}
+    DEC_NUM_HEADS: 20
+    DEC_HEAD_DIM: 128
+    DEC_HIDDEN: 2560
+    DEC_FFN_MID: 6912
+    DEC_VOCAB: 32000
+
+  bits_per_value:
+    All: 8
+
+  einsums:
+    - name: EncInputLoad
+      tensor_accesses:
+        - {name: enc_input_raw, projection: [batch, enc_seq_len, enc_hidden]}
+        - {name: enc_input, projection: [batch, enc_seq_len, enc_hidden], output: True}
+
+    - name: EncQueryProj
+      tensor_accesses:
+        - {name: enc_input, projection: [batch, enc_seq_len, enc_hidden]}
+        - {name: enc_w_query, projection: [enc_num_heads, enc_head_dim, enc_hidden]}
+        - {name: enc_queries, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim], output: True}
+
+    - name: EncKeyProj
+      tensor_accesses:
+        - {name: enc_input, projection: [batch, enc_seq_len, enc_hidden]}
+        - {name: enc_w_key, projection: [enc_num_heads, enc_head_dim, enc_hidden]}
+        - {name: enc_keys, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim], output: True}
+
+    - name: EncValueProj
+      tensor_accesses:
+        - {name: enc_input, projection: [batch, enc_seq_len, enc_hidden]}
+        - {name: enc_w_value, projection: [enc_num_heads, enc_head_dim, enc_hidden]}
+        - {name: enc_values, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim], output: True}
+
+    - name: EncAttentionScores
+      tensor_accesses:
+        - {name: enc_queries, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim]}
+        - {name: enc_keys, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim]}
+        - {name: enc_attn_scores, projection: [batch, enc_seq_len, enc_seq_len, enc_num_heads], output: True}
+
+    - name: EncAttentionWeights
+      tensor_accesses:
+        - {name: enc_attn_scores, projection: [batch, enc_seq_len, enc_seq_len, enc_num_heads]}
+        - {name: enc_attn_weights, projection: [batch, enc_seq_len, enc_seq_len, enc_num_heads], output: True}
+
+    - name: EncAttentionOut
+      tensor_accesses:
+        - {name: enc_attn_weights, projection: [batch, enc_seq_len, enc_seq_len, enc_num_heads]}
+        - {name: enc_values, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim]}
+        - {name: enc_attn_out, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim], output: True}
+
+    - name: EncAttentionProj
+      tensor_accesses:
+        - {name: enc_attn_out, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim]}
+        - {name: enc_w_out, projection: [enc_num_heads, enc_head_dim, enc_hidden]}
+        - {name: enc_attn_proj, projection: [batch, enc_seq_len, enc_hidden], output: True}
+
+    - name: EncFfnUp
+      tensor_accesses:
+        - {name: enc_attn_proj, projection: [batch, enc_seq_len, enc_hidden]}
+        - {name: enc_w_ffn_up, projection: [enc_hidden, enc_ffn_mid]}
+        - {name: enc_ffn_hidden, projection: [batch, enc_seq_len, enc_ffn_mid], output: True}
+
+    - name: EncGeluActivation
+      tensor_accesses:
+        - {name: enc_ffn_hidden, projection: [batch, enc_seq_len, enc_ffn_mid]}
+        - {name: enc_ffn_hidden_act, projection: [batch, enc_seq_len, enc_ffn_mid], output: True}
+
+    - name: EncFfnDown
+      tensor_accesses:
+        - {name: enc_ffn_hidden_act, projection: [batch, enc_seq_len, enc_ffn_mid]}
+        - {name: enc_w_ffn_down, projection: [enc_ffn_mid, enc_embed_dim]}
+        - {name: enc_ffn_out, projection: [batch, enc_seq_len, enc_embed_dim], output: True}
+
+    - name: ClsPooling
+      tensor_accesses:
+        - {name: enc_ffn_out, projection: [batch, enc_seq_len, enc_embed_dim]}
+        - {name: query_embedding, projection: [batch, enc_embed_dim], output: True}
+
+    - name: FaissScoreComputation
+      tensor_accesses:
+        - {name: query_embedding, projection: [batch, enc_embed_dim]}
+        - {name: corpus_embeddings, projection: [num_docs, enc_embed_dim]}
+        - {name: doc_scores, projection: [batch, num_docs], output: True}
+
+    - name: DocumentGather
+      tensor_accesses:
+        - {name: topk_doc_ids, projection: [batch, top_k_docs]}
+        - {name: corpus_tokens, projection: [top_k_docs, doc_len]}
+        - {name: topk_tokens, projection: [batch, top_k_docs, doc_len], output: True}
+
+    - name: DecoderInputSetup
+      tensor_accesses:
+        - {name: topk_tokens, projection: [batch, top_k_docs, doc_len]}
+        - {name: dec_input, projection: [batch, dec_seq_len, dec_hidden], output: True}
+
+    - name: DecQueryProj
+      tensor_accesses:
+        - {name: dec_input, projection: [batch, dec_seq_len, dec_hidden]}
+        - {name: dec_w_query, projection: [dec_num_heads, dec_head_dim, dec_hidden]}
+        - {name: dec_queries, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim], output: True}
+
+    - name: DecKeyProj
+      tensor_accesses:
+        - {name: dec_input, projection: [batch, dec_seq_len, dec_hidden]}
+        - {name: dec_w_key, projection: [dec_num_heads, dec_head_dim, dec_hidden]}
+        - {name: dec_keys, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim], output: True}
+
+    - name: DecValueProj
+      tensor_accesses:
+        - {name: dec_input, projection: [batch, dec_seq_len, dec_hidden]}
+        - {name: dec_w_value, projection: [dec_num_heads, dec_head_dim, dec_hidden]}
+        - {name: dec_values, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim], output: True}
+
+    - name: DecAttentionScores
+      tensor_accesses:
+        - {name: dec_queries, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim]}
+        - {name: dec_keys, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim]}
+        - {name: dec_attn_scores, projection: [batch, dec_seq_len, dec_seq_len, dec_num_heads], output: True}
+
+    - name: DecAttentionWeights
+      tensor_accesses:
+        - {name: dec_attn_scores, projection: [batch, dec_seq_len, dec_seq_len, dec_num_heads]}
+        - {name: dec_attn_weights, projection: [batch, dec_seq_len, dec_seq_len, dec_num_heads], output: True}
+
+    - name: DecAttentionOut
+      tensor_accesses:
+        - {name: dec_attn_weights, projection: [batch, dec_seq_len, dec_seq_len, dec_num_heads]}
+        - {name: dec_values, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim]}
+        - {name: dec_attn_out, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim], output: True}
+
+    - name: DecAttentionProj
+      tensor_accesses:
+        - {name: dec_attn_out, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim]}
+        - {name: dec_w_out, projection: [dec_num_heads, dec_head_dim, dec_hidden]}
+        - {name: dec_attn_proj, projection: [batch, dec_seq_len, dec_hidden], output: True}
+
+    - name: DecFfnGate
+      tensor_accesses:
+        - {name: dec_attn_proj, projection: [batch, dec_seq_len, dec_hidden]}
+        - {name: dec_w_ffn_gate, projection: [dec_hidden, dec_ffn_mid]}
+        - {name: dec_ffn_gate, projection: [batch, dec_seq_len, dec_ffn_mid], output: True}
+
+    - name: DecFfnUp
+      tensor_accesses:
+        - {name: dec_attn_proj, projection: [batch, dec_seq_len, dec_hidden]}
+        - {name: dec_w_ffn_up, projection: [dec_hidden, dec_ffn_mid]}
+        - {name: dec_ffn_up, projection: [batch, dec_seq_len, dec_ffn_mid], output: True}
+
+    - name: DecFfnGateAct
+      tensor_accesses:
+        - {name: dec_ffn_up, projection: [batch, dec_seq_len, dec_ffn_mid]}
+        - {name: dec_ffn_gate_act, projection: [batch, dec_seq_len, dec_ffn_mid], output: True}
+
+    - name: SwigluElementwiseMult
+      tensor_accesses:
+        - {name: dec_ffn_gate_act, projection: [batch, dec_seq_len, dec_ffn_mid]}
+        - {name: dec_ffn_up, projection: [batch, dec_seq_len, dec_ffn_mid]}
+        - {name: dec_ffn_swiglu, projection: [batch, dec_seq_len, dec_ffn_mid], output: True}
+
+    - name: DecFfnDown
+      tensor_accesses:
+        - {name: dec_ffn_swiglu, projection: [batch, dec_seq_len, dec_ffn_mid]}
+        - {name: dec_w_ffn_down, projection: [dec_ffn_mid, dec_hidden]}
+        - {name: dec_ffn_out, projection: [batch, dec_seq_len, dec_hidden], output: True}
