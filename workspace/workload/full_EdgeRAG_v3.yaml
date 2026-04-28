@@ -38,25 +38,29 @@ workload:
     - name: EncInputLoad
       tensor_accesses:
         - {name: enc_input_raw, projection: [batch, enc_seq_len, enc_hidden]}
-        - {name: enc_input, projection: [batch, enc_seq_len, enc_hidden], output: True}  
+        - {name: enc_input, projection: [batch, enc_seq_len, enc_hidden], output: True} 
+      renames: {input: enc_input_raw}
 
     - name: EncQueryProj
       tensor_accesses:
         - {name: enc_input, projection: [batch, enc_seq_len, enc_hidden]}
         - {name: enc_w_query, projection: [enc_num_heads, enc_head_dim, enc_hidden]}
         - {name: enc_queries, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim], output: True}
+      renames: {input: enc_input}
 
     - name: EncKeyProj
       tensor_accesses:
         - {name: enc_input, projection: [batch, enc_seq_len, enc_hidden]}
         - {name: enc_w_key, projection: [enc_num_heads, enc_head_dim, enc_hidden]}
         - {name: enc_keys, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim], output: True}
+      renames: {input: enc_input}
 
     - name: EncValueProj
       tensor_accesses:
         - {name: enc_input, projection: [batch, enc_seq_len, enc_hidden]}
         - {name: enc_w_value, projection: [enc_num_heads, enc_head_dim, enc_hidden]}
         - {name: enc_values, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim], output: True}
+      renames: {input: enc_input}
 
     - name: EncAttentionScores
       tensor_accesses:
@@ -82,12 +86,14 @@ workload:
         - {name: enc_attn_out, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim]}
         - {name: enc_w_out, projection: [enc_num_heads, enc_head_dim, enc_hidden]}
         - {name: enc_attn_proj, projection: [batch, enc_seq_len, enc_hidden], output: True}
+      renames: {input: enc_attn_out}
 
     - name: EncFfnUp
       tensor_accesses:
         - {name: enc_attn_proj, projection: [batch, enc_seq_len, enc_hidden]}
         - {name: enc_w_ffn_up, projection: [enc_hidden, enc_ffn_mid]}
         - {name: enc_ffn_hidden, projection: [batch, enc_seq_len, enc_ffn_mid], output: True}
+      renames: {input: enc_attn_proj}
 
     - name: EncGeluActivation
       tensor_accesses:
@@ -99,6 +105,7 @@ workload:
         - {name: enc_ffn_hidden_act, projection: [batch, enc_seq_len, enc_ffn_mid]}
         - {name: enc_w_ffn_down, projection: [enc_ffn_mid, enc_embed_dim]}
         - {name: enc_ffn_out, projection: [batch, enc_seq_len, enc_embed_dim], output: True}
+      renames: {input: enc_ffn_hidden_act}
 
     - name: ClsPooling
       tensor_accesses:
@@ -110,6 +117,7 @@ workload:
         - {name: query_embedding, projection: [batch, enc_embed_dim]}
         - {name: corpus_embeddings, projection: [num_docs, enc_embed_dim]}
         - {name: doc_scores, projection: [batch, num_docs], output: True}
+      renames: {input: query_embedding}
 
     - name: DocumentGather
       tensor_accesses:
@@ -118,28 +126,32 @@ workload:
         - {name: topk_tokens, projection: [batch, top_k_docs, doc_len], output: True}
       renames: {input: topk_doc_ids}
 
-    - name: DecoderInputSetup
+    - name: DecoderInputLoad # changed, matches Accelforge example and encoder input
       tensor_accesses:
-        - {name: topk_tokens, projection: [batch, top_k_docs, doc_len]}
+        - {name: dec_input_raw, projection: [batch, dec_seq_len, dec_hidden]}
         - {name: dec_input, projection: [batch, dec_seq_len, dec_hidden], output: True}
+      renames: {input: dec_input_raw}
 
     - name: DecQueryProj
       tensor_accesses:
         - {name: dec_input, projection: [batch, dec_seq_len, dec_hidden]}
         - {name: dec_w_query, projection: [dec_num_heads, dec_head_dim, dec_hidden]}
         - {name: dec_queries, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim], output: True}
+      renames: {input: dec_input}
 
     - name: DecKeyProj
       tensor_accesses:
         - {name: dec_input, projection: [batch, dec_seq_len, dec_hidden]}
         - {name: dec_w_key, projection: [dec_num_heads, dec_head_dim, dec_hidden]}
         - {name: dec_keys, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim], output: True}
+      renames: {input: dec_input}
 
     - name: DecValueProj
       tensor_accesses:
         - {name: dec_input, projection: [batch, dec_seq_len, dec_hidden]}
         - {name: dec_w_value, projection: [dec_num_heads, dec_head_dim, dec_hidden]}
         - {name: dec_values, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim], output: True}
+      renames: {input: dec_input}
 
     - name: DecAttentionScores
       tensor_accesses:
@@ -165,18 +177,21 @@ workload:
         - {name: dec_attn_out, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim]}
         - {name: dec_w_out, projection: [dec_num_heads, dec_head_dim, dec_hidden]}
         - {name: dec_attn_proj, projection: [batch, dec_seq_len, dec_hidden], output: True}
+      renames: {input: dec_attn_out}
 
     - name: DecFfnGate
       tensor_accesses:
         - {name: dec_attn_proj, projection: [batch, dec_seq_len, dec_hidden]}
         - {name: dec_w_ffn_gate, projection: [dec_hidden, dec_ffn_mid]}
         - {name: dec_ffn_gate, projection: [batch, dec_seq_len, dec_ffn_mid], output: True}
+      renames: {input: dec_attn_proj}
 
     - name: DecFfnUp
       tensor_accesses:
         - {name: dec_attn_proj, projection: [batch, dec_seq_len, dec_hidden]}
         - {name: dec_w_ffn_up, projection: [dec_hidden, dec_ffn_mid]}
         - {name: dec_ffn_up, projection: [batch, dec_seq_len, dec_ffn_mid], output: True}
+      renames: {input: dec_attn_proj}
 
     - name: DecFfnGateAct
       tensor_accesses:
@@ -195,6 +210,7 @@ workload:
         - {name: dec_ffn_swiglu, projection: [batch, dec_seq_len, dec_ffn_mid]}
         - {name: dec_w_ffn_down, projection: [dec_ffn_mid, dec_hidden]}
         - {name: dec_ffn_out, projection: [batch, dec_seq_len, dec_hidden], output: True}
+      renames: {input: dec_ffn_swiglu}
 
 renames:
   einsums:
