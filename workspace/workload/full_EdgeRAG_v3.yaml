@@ -31,14 +31,14 @@ workload:
     DEC_FFN_MID: 6912
     DEC_VOCAB: 32000
 
-  bits_per_value:
-    All: 8
+  bits_per_value: {All: 8}
+  persistent_tensors: weight - Intermediates
 
   einsums:
     - name: EncInputLoad
       tensor_accesses:
         - {name: enc_input_raw, projection: [batch, enc_seq_len, enc_hidden]}
-        - {name: enc_input, projection: [batch, enc_seq_len, enc_hidden], output: True}
+        - {name: enc_input, projection: [batch, enc_seq_len, enc_hidden], output: True}  
 
     - name: EncQueryProj
       tensor_accesses:
@@ -63,6 +63,7 @@ workload:
         - {name: enc_queries, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim]}
         - {name: enc_keys, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim]}
         - {name: enc_attn_scores, projection: [batch, enc_seq_len, enc_seq_len, enc_num_heads], output: True}
+      renames: {input: enc_queries}
 
     - name: EncAttentionWeights
       tensor_accesses:
@@ -74,6 +75,7 @@ workload:
         - {name: enc_attn_weights, projection: [batch, enc_seq_len, enc_seq_len, enc_num_heads]}
         - {name: enc_values, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim]}
         - {name: enc_attn_out, projection: [batch, enc_seq_len, enc_num_heads, enc_head_dim], output: True}
+      renames: {input: enc_attn_weights}
 
     - name: EncAttentionProj
       tensor_accesses:
@@ -114,6 +116,7 @@ workload:
         - {name: topk_doc_ids, projection: [batch, top_k_docs]}
         - {name: corpus_tokens, projection: [top_k_docs, doc_len]}
         - {name: topk_tokens, projection: [batch, top_k_docs, doc_len], output: True}
+      renames: {input: topk_doc_ids}
 
     - name: DecoderInputSetup
       tensor_accesses:
@@ -143,6 +146,7 @@ workload:
         - {name: dec_queries, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim]}
         - {name: dec_keys, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim]}
         - {name: dec_attn_scores, projection: [batch, dec_seq_len, dec_seq_len, dec_num_heads], output: True}
+      renames: {input: dec_queries}
 
     - name: DecAttentionWeights
       tensor_accesses:
@@ -154,6 +158,7 @@ workload:
         - {name: dec_attn_weights, projection: [batch, dec_seq_len, dec_seq_len, dec_num_heads]}
         - {name: dec_values, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim]}
         - {name: dec_attn_out, projection: [batch, dec_seq_len, dec_num_heads, dec_head_dim], output: True}
+      renames: {input: dec_attn_weights}
 
     - name: DecAttentionProj
       tensor_accesses:
@@ -183,9 +188,24 @@ workload:
         - {name: dec_ffn_gate_act, projection: [batch, dec_seq_len, dec_ffn_mid]}
         - {name: dec_ffn_up, projection: [batch, dec_seq_len, dec_ffn_mid]}
         - {name: dec_ffn_swiglu, projection: [batch, dec_seq_len, dec_ffn_mid], output: True}
+      renames: {input: dec_ffn_gate_act}
 
     - name: DecFfnDown
       tensor_accesses:
         - {name: dec_ffn_swiglu, projection: [batch, dec_seq_len, dec_ffn_mid]}
         - {name: dec_w_ffn_down, projection: [dec_ffn_mid, dec_hidden]}
         - {name: dec_ffn_out, projection: [batch, dec_seq_len, dec_hidden], output: True}
+
+renames:
+  einsums:
+    - name: default
+      tensor_accesses:
+        - name: input
+          source: Inputs & Intermediates if len(All) == 3 else Inputs
+          expected_count: 1
+        - name: output
+          source: Outputs
+          expected_count: 1
+        - name: weight
+          source: ~(input | output)
+          expected_count: 1 if len(All) == 3 else 0
