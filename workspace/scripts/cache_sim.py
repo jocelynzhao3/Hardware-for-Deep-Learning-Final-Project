@@ -1,24 +1,40 @@
 """Cache simulation for Experiment 2: Relevance-Aware DRAM Caching.
 
-Three cache replacement policies over a synthetic Zipf-distributed access trace:
-  - No cache:      every access is served from disk.
-  - LFU cost-aware: EdgeRAG Algorithm 2 — evict argmin(gen_latency * counter)
-                    with per-step exponential counter decay.
-  - Bélády OPT:    offline oracle — evict the item whose next use is farthest
-                   in the future (minimum miss-count lower bound).
+Scope
+-----
+This module models cache *replacement behavior* only.  Hardware energy and
+TTFT latency are computed in the notebook by multiplying hit/miss counts by
+per-access costs derived from EdgeRAG-aligned hardware constants (LPDDR5-4250
+DRAM at 34 GB/s, UHS-I SD-card at 0.104 GB/s).
 
-Trace generator:
-  synth_trace() draws K document IDs per query from a Zipf distribution whose
-  exponent is tuned (via binary search on the expected-unique-docs formula) so
-  that total_accesses / unique_docs ≈ the requested reuse_ratio.
+One trace element = one document embedding row access
+-----------------------------------------------------
+A single cache access is one lookup of a 768-dimensional INT8 document
+embedding row (768 bytes).  Each query in the trace contributes k_per_query
+such accesses, so  len(trace) = n_queries × k_per_query.
+
+Three cache replacement policies
+---------------------------------
+  - No cache:       every access is a miss; nothing is ever cached.
+  - LFU cost-aware: EdgeRAG Algorithm 2 — evict argmin(ttft_cost[j] × counter[j])
+                    with per-step exponential counter decay.
+                    When all per-document TTFT costs are equal (uniform), this
+                    reduces to plain decayed LFU, isolating reuse locality.
+  - Bélády OPT:    offline oracle — evict the item whose next use is farthest
+                   in the future (minimum-miss-count lower bound, not deployable).
+
+Trace generator
+---------------
+synth_trace() draws k_per_query document IDs per query from a Zipf distribution
+whose exponent is tuned (binary search on the expected-unique-docs formula) so
+that  total_accesses / unique_docs ≈ the requested reuse_ratio.
 
 Note on parameter scale
 -----------------------
-With the plan's default n_docs=100 000 and n_queries=5 000:
+With n_docs=100 000 and n_queries=5 000:
   total accesses = 100 000,  unique docs ≤ 100 000 (80 000 at reuse 1.25).
   DRAM capacity at 1 GB = 1 398 101 embedding slots >> 80 000 unique docs.
-So the cache never fills and LFU ≈ OPT for all DRAM sizes in that regime
-(the DRAM-sweep axis becomes flat; the interesting axis is reuse_ratio).
+The cache never fills and LFU ≈ OPT for all DRAM sizes in that regime.
 
 To see evictions and a non-trivial LFU-vs-OPT gap across the 1–16 GB sweep,
 use n_docs_trace ≥ 2 000 000 and n_queries ≥ 100 000 in the notebook.
@@ -100,10 +116,48 @@ def synth_trace(
     weights = 1.0 / (doc_ranks ** alpha)
     weights /= weights.sum()
 
+    # numpy's `rng.choice(p=...)` rebuilds the CDF on every call, so it is
+    # O(n_docs) per query regardless of replace=True/False.  For n_docs in the
+    # millions × 100k+ queries that is intractable.  Precompute the CDF once
+    # and sample via vectorised `searchsorted` (O(k log n) per query).
+    #
+    # We sample with replacement and dedupe per query.  Since k_per_query is
+    # tiny relative to n_docs, the duplicate rate is negligible
+    # (P(dup) ~ k * max(weights)), but we oversample by 3x and fall back to
+    # a top-up loop in the rare case the dedupe set is short.
+    cdf = np.cumsum(weights)
+    cdf[-1] = 1.0  # guard against floating-point round-off
+
     trace: list[int] = []
+    oversample = max(k_per_query * 3, k_per_query + 16)
+
     for _ in range(n_queries):
-        draws = rng.choice(n_docs, size=k_per_query, replace=False, p=weights)
-        trace.extend(int(d) for d in draws)
+        raw = np.searchsorted(cdf, rng.random(size=oversample), side="right")
+        seen: set[int] = set()
+        uniq: list[int] = []
+        for d in raw:
+            di = int(d)
+            if di < n_docs and di not in seen:
+                seen.add(di)
+                uniq.append(di)
+                if len(uniq) == k_per_query:
+                    break
+
+        # Top-up loop for the (rare) case the oversample didn't yield enough
+        # uniques.  Each top-up draws another batch using the same fast path.
+        while len(uniq) < k_per_query:
+            extra = np.searchsorted(
+                cdf, rng.random(size=k_per_query), side="right",
+            )
+            for d in extra:
+                di = int(d)
+                if di < n_docs and di not in seen:
+                    seen.add(di)
+                    uniq.append(di)
+                    if len(uniq) == k_per_query:
+                        break
+
+        trace.extend(uniq)
 
     return trace
 
