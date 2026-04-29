@@ -35,7 +35,8 @@ class Result:
         if self._per_component_energy is None:
             raw = self._mappings.energy(per_component=True)
             self._per_component_energy = {
-                k: float(v) for k, v in raw.items()
+                k: float(sum(v) if isinstance(v, (list, tuple)) else v)
+                for k, v in raw.items()
             }
         return self._per_component_energy
 

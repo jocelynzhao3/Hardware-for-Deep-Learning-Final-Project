@@ -1,0 +1,194 @@
+# --- Array geometry ---
+{% set ARRAY_ROWS = ARRAY_ROWS | default(128) %}
+{% set ARRAY_COLS = ARRAY_COLS | default(128) %}
+ 
+# --- Memory subsystem ---
+{% set DRAM_BW_GBps       = DRAM_BW_GBps       | default(68)    %}  {# LPDDR5 bandwidth in GB/s #}
+{% set SRAM_READ_BW_GBps  = SRAM_READ_BW_GBps  | default(512)   %}  {# On-chip SRAM read  bandwidth in GB/s #}
+{% set SRAM_WRITE_BW_GBps = SRAM_WRITE_BW_GBps | default(128)   %}  {# On-chip SRAM write bandwidth in GB/s #}
+{% set SRAM_SIZE_MB       = SRAM_SIZE_MB       | default(8)     %}  {# On-chip SRAM capacity in MB #}
+{% set DRAM_SIZE_GB       = DRAM_SIZE_GB       | default(8)     %}  {# Off-chip DRAM capacity in GB #}
+ 
+# --- Compute ---
+{% set MAC_ENERGY_pJ      = MAC_ENERGY_pJ      | default(0.084) %}  {# FP16 MAC energy in pJ #}
+{% set MAC_CLOCK_GHz      = MAC_CLOCK_GHz      | default(1)     %}  {# Clock frequency in GHz #}
+ 
+# --- Workload dimensions ---
+{% set N_TOKENS    = N_TOKENS    | default(512) %}
+{% set N_DOCS      = N_DOCS      | default(2_000_000) %}
+{% set K           = K           | default(10) %}
+{% set L           = L           | default(512) %}
+{% set BATCH_SIZE  = BATCH_SIZE  | default(1) %}
+{% set INPUT_TOKENS = INPUT_TOKENS | default(N_TOKENS + K * L) %}
+ 
+ 
+# =============================================================================
+# ARCHITECTURE
+# =============================================================================
+arch:
+  nodes:
+ 
+  # =========================================================================
+  # Tier 0 — Disk (infinite capacity, models NVMe SSD latency only)
+  # =========================================================================
+  # Corpus tokens and pre-computed embeddings are stored here.
+  # Embedding is done offline, so disk energy is zero.
+  # Bandwidth: 7 GB/s (PCIe 4.0 x4)
+  # =========================================================================
+  - !Memory
+    name: Disk
+    size: inf
+    leak_power: 0
+    area: 0
+    actions:
+    - {name: read,  energy: 0, latency: 1 / (7e9 * 8)}
+    - {name: write, energy: 0, latency: 1 / (7e9 * 8)}
+    tensors: {keep: ~Intermediates, may_keep: All}
+ 
+  # =========================================================================
+  # Tier 1 — Off-chip DRAM (LPDDR5)
+  # =========================================================================
+  # Stores model weights, corpus embeddings, and any tensors that don't
+  # fit in on-chip SRAM. Energy per access: 7.03 pJ (JEDEC LPDDR5 spec).
+  # =========================================================================
+  - !Memory
+    name: MainMemory
+    size: {{DRAM_SIZE_GB}} * 1024 * 1024 * 1024 * 8     # {{DRAM_SIZE_GB}} GB → bits
+    leak_power: 0
+    area: 0
+    actions:
+    - {name: read,  energy: 7.03e-12, latency: 1 / ({{DRAM_BW_GBps}}e9 * 8)}
+    - {name: write, energy: 7.03e-12, latency: 1 / ({{DRAM_BW_GBps}}e9 * 8)}
+    tensors: {keep: ~Intermediates, may_keep: All}
+ 
+  # =========================================================================
+  # Tier 2 — Global Buffer (On-chip SRAM scratchpad)
+  # =========================================================================
+  # Shared buffer that feeds the systolic array. Holds tiled slices of
+  # inputs and weights, and receives final output tiles from the array.
+  # Energy: 0.249 pJ/bit read, 0.293 pJ/bit write (TPU v4i values).
+  # =========================================================================
+  - !Memory
+    name: GlobalBuffer
+    size: {{SRAM_SIZE_MB}} * 1024 * 1024 * 8             # {{SRAM_SIZE_MB}} MB → bits
+    total_latency: max(read_latency, write_latency)
+    leak_power: 0
+    area: {{SRAM_SIZE_MB}}e-6                            # ~1 mm² per MB at 16 nm
+    actions:
+    - {name: read,  energy: 0.249e-12, latency: 1 / ({{SRAM_READ_BW_GBps}}e9 * 8)}
+    - {name: write, energy: 0.293e-12, latency: 1 / ({{SRAM_WRITE_BW_GBps}}e9 * 8)}
+    tensors: {keep: All}
+ 
+  # =========================================================================
+  # Tier 3 — Accumulation Buffer
+  # =========================================================================
+  # Sits between the global buffer and the PE array. When the K (reduction)
+  # dimension exceeds 128 rows and requires multiple temporal passes,
+  # partial sums are held here rather than round-tripping to the large
+  # GlobalBuffer. One 32-bit accumulator per column.
+  # =========================================================================
+  - !Memory
+    name: AccumulationBuffer
+    size: {{ARRAY_COLS}} * 32                            # 128 columns × 32-bit accumulators
+    leak_power: 0
+    area: 1e-10                                          # negligible
+    actions:
+    - {name: read,  energy: 0.02e-12, latency: 1 / ({{MAC_CLOCK_GHz}}e9)}
+    - {name: write, energy: 0.02e-12, latency: 1 / ({{MAC_CLOCK_GHz}}e9)}
+    tensors: {keep: output}                              # holds partial sums between K-tile passes
+ 
+  # =========================================================================
+  # Tier 4 — Spatial Array: Column Fanout (N / output dimension)
+  # =========================================================================
+  # 128 columns, each computing a different output element.
+  # Weights are multicast: the same weight column vector is shared
+  # across all PEs in a column (they all work on the same output channel,
+  # reducing along K).
+  # =========================================================================
+  - !Container
+    name: PEColumns
+    spatial:
+    - name: col_spatial
+      fanout: {{ARRAY_COLS}}
+      may_reuse: weight                                  # weight col broadcast across N
+      reuse: weight
+      min_usage: 1
+ 
+  # =========================================================================
+  # Tier 5 — Spatial Array: Row Fanout (K / reduction dimension)
+  # =========================================================================
+  # 128 rows, each receiving a different element of the input vector.
+  # Inputs are multicast: the same input element is shared across all
+  # PEs in a row (they all multiply it by different weights for different
+  # output channels).
+  # =========================================================================
+  - !Container
+    name: PERows
+    spatial:
+    - name: row_spatial
+      fanout: {{ARRAY_ROWS}}
+      may_reuse: input                                   # input element broadcast across K
+      reuse: input
+      min_usage: 1
+ 
+  # =========================================================================
+  # Tier 6 — Per-PE Accumulator (Output-Stationary Register)
+  # =========================================================================
+  # This is the defining feature of output-stationary dataflow: each PE
+  # has a tiny register that holds the running partial sum. Weights and
+  # inputs stream through, but the output stays put until the full K
+  # reduction is complete.
+  #
+  # Size: one 32-bit accumulator (FP16 inputs produce up to 32-bit psums)
+  # Energy: ~5 fJ per access (register-file level at 16 nm)
+  # =========================================================================
+  - !Memory
+    name: PEAccumulator
+    size: 1 * 32                                         # one 32-bit accumulator
+    leak_power: 0
+    area: 1e-12                                          # single register, negligible
+    actions:
+    - {name: read,  energy: 0.005e-12, latency: 1 / ({{MAC_CLOCK_GHz}}e9)}
+    - {name: write, energy: 0.005e-12, latency: 1 / ({{MAC_CLOCK_GHz}}e9)}
+    tensors: {keep: output}                              # OUTPUT stays here — this is OS!
+ 
+  # =========================================================================
+  # Tier 7 — MAC Compute Unit
+  # =========================================================================
+  # FP16 multiply-accumulate. One per PE, 128×128 = 16,384 total.
+  # Energy: 0.084 pJ/MAC (consistent with NVDLA / TPU v4i estimates).
+  # Peak throughput: 128 × 128 × 1 GHz = 16.384 TOPS (FP16).
+  # =========================================================================
+  - !Compute
+    name: MAC
+    leak_power: 0
+    area: 9e-11
+    actions:
+    - {name: compute, energy: {{MAC_ENERGY_pJ}}e-12, latency: 1 / ({{MAC_CLOCK_GHz}}e9)}
+    enabled: len(All) == 3
+ 
+  # =========================================================================
+  # Copy unit — for 2-tensor operations (softmax, activations, pooling)
+  # =========================================================================
+  # These operations have zero compute energy; their cost is captured
+  # entirely by the memory read/write traffic they generate.
+  # =========================================================================
+  - !Compute
+    name: Copy
+    leak_power: 0
+    area: 0
+    actions:
+    - {name: compute, energy: 0, latency: 1 / ({{MAC_CLOCK_GHz}}e9)}
+    enabled: len(All) == 2
+ 
+ 
+# =============================================================================
+# GLOBAL VARIABLES
+# =============================================================================
+variables:
+  supported_input_bits:  16
+  supported_weight_bits: 16
+  supported_output_bits: 16
+ 
+ 
+renames: {}''
