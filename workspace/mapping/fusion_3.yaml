@@ -2,27 +2,30 @@ mapping:
   nodes:
 
   # ============================================================
-  # MainMemory: persistent weights + final outputs + raw inputs.
-  # Intermediates (enc_*, dec_* activations) are excluded per
-  # tensors: {keep: ~Intermediates} in the arch.
-  # corpus_embeddings (~1.5GB) must live here permanently.
+  # MainMemory: ALL persistent non-intermediate input tensors
+  # must be listed here explicitly to avoid may_keep fallback
+  # silently charging MainMemory energy on einsums that don't
+  # use it. enc_input_raw / dec_input_raw were the offenders
+  # in v2 (they were absent, so the framework used may_keep).
   # ============================================================
   - !Storage
     component: MainMemory
     tensors:
-      - corpus_embeddings
+      - enc_input_raw      # explicit — was absent in v2, triggering may_keep fallback
+      - dec_input_raw      # same issue on decoder side
+      - corpus_embeddings  # 2M x 768 x 1B = ~1.5 GB, must live here
       - topk_doc_ids
       - corpus_tokens
 
   # ============================================================
-  # GlobalBuffer (128MB): weight tiles streamed from MainMemory,
-  # and large intermediate tiles that don't fit in LocalBuffer.
-  # corpus_embeddings tiles land here before inner compute.
+  # GlobalBuffer (128MB): all weight matrices + final outputs.
+  # Total weight footprint ~50 MB at int8, comfortably resident.
+  # Explicit list prevents may_keep from silently routing weights
+  # through MainMemory on cold-fetch.
   # ============================================================
   - !Storage
     component: GlobalBuffer
-    tensors: 
-      - enc_input_raw
+    tensors:
       - enc_w_query
       - enc_w_key
       - enc_w_value
@@ -36,14 +39,15 @@ mapping:
       - dec_w_ffn_gate
       - dec_w_ffn_up
       - dec_w_ffn_down
-      - doc_scores         # final output of Faiss, persisted
+      - doc_scores         # [1, 2M] = 2 MB, final output of FAISS
       - topk_tokens        # output of DocumentGather
       - dec_ffn_out        # final decoder output
+
   # ============================================================
-  # LocalBuffer (4MB, x4 spatial): on-chip intermediate home.
-  # Replaces OnChipSRAM from the reference mapping.
-  # tensors: {keep: input | output} per arch — activations only,
-  # no weights (weights go to Register inside the PE).
+  # LocalBuffer (4MB, x4 spatial): on-chip intermediates.
+  # Encoder activations: enc_input(384KB) + enc_queries/keys/values
+  # (384KB each) fit. FFN intermediates need seq tiling (see below).
+  # query_embedding (768B) stays resident for FAISS fusion.
   # ============================================================
   - !Storage
     component: LocalBuffer
@@ -59,6 +63,7 @@ mapping:
       - enc_ffn_hidden
       - enc_ffn_hidden_act
       - enc_ffn_out
+      - query_embedding    # 768B, stays resident across ClsPooling -> FAISS
       - dec_input
       - dec_queries
       - dec_keys
@@ -72,11 +77,6 @@ mapping:
       - dec_ffn_gate_act
       - dec_ffn_swiglu
 
-  # ============================================================
-  # Register (1 byte, inside PE): weight-stationary storage.
-  # Declared here at top level; each MAC block below overrides
-  # with the specific weight tensor for that einsum.
-  # ============================================================
   - !Storage
     component: Register
     tensors: []
@@ -86,210 +86,297 @@ mapping:
 
     # ----------------------------------------------------------
     # EncInputLoad  [2-tensor -> ScalarUnit]
-    # enc_input_raw -> enc_input
-    # No weight; ScalarUnit handles element-wise copy/cast.
+    # enc_input_raw (MainMemory) -> enc_input (LocalBuffer)
+    #
+    # FIX: tile_shape 1->128 on both dims. With 128-element tiles
+    # the ScalarUnit processes one 128x128 block per invocation,
+    # matching Z=4 spatial granularity and reducing loop overhead.
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
       - !Storage {component: LocalBuffer, tensors: [enc_input]}
-      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
-      - !Temporal {rank_variable: enc_hidden, tile_shape: 1}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 128}
+      - !Temporal {rank_variable: enc_hidden, tile_shape: 128}
       - !Compute {component: ScalarUnit, einsum: EncInputLoad}
 
     # ----------------------------------------------------------
     # EncQueryProj  [3-tensor -> MAC]
-    # enc_input x enc_w_query -> enc_queries
-    # enc_input stays in LocalBuffer from above (fused).
-    # enc_w_query streams GlobalBuffer -> Register.
+    # enc_input (LocalBuffer, resident) x enc_w_query -> enc_queries
+    #
+    # FIX v2 had tile_shape:1 everywhere and weight loops BELOW
+    # GlobalBuffer, meaning the weight was reloaded for every
+    # (seq, head, head_dim, hidden) element — zero reuse.
+    #
+    # Corrected loop order (outer -> inner):
+    #   enc_num_heads, enc_head_dim  <- above GlobalBuffer
+    #     GlobalBuffer: weight tile [heads, head_dim, *] loaded once
+    #       Register: weight tile [1, 64, 128] stationary
+    #         enc_seq_len=128   <- reuse weight across 128 input rows
+    #           enc_hidden=128  <- reduction, innermost
+    #
+    # Weight GlobalBuffer reads: (12/1) x (64/64) = 12 tiles of
+    # [1, 64, 768] = 55 KB each. Each tile reused for 512/128 = 4
+    # seq_len passes and 768/128 = 6 enc_hidden reduction passes.
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
       - !Storage {component: LocalBuffer, tensors: [enc_queries]}
-      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
       - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
-      - !Temporal {rank_variable: enc_head_dim, tile_shape: 1}
+      - !Temporal {rank_variable: enc_head_dim, tile_shape: 64}
       - !Storage {component: GlobalBuffer, tensors: [enc_w_query]}
       - !Storage {component: Register, tensors: [enc_w_query]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 128}
+      - !Temporal {rank_variable: enc_hidden, tile_shape: 128}
       - !Compute {component: MAC, einsum: EncQueryProj}
 
     # ----------------------------------------------------------
     # EncKeyProj  [3-tensor -> MAC]
-    # enc_input x enc_w_key -> enc_keys
-    # enc_input still resident in LocalBuffer.
+    # enc_input (LocalBuffer, still resident) x enc_w_key -> enc_keys
+    # Same corrected loop order as EncQueryProj.
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
       - !Storage {component: LocalBuffer, tensors: [enc_keys]}
-      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
       - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
-      - !Temporal {rank_variable: enc_head_dim, tile_shape: 1}
+      - !Temporal {rank_variable: enc_head_dim, tile_shape: 64}
       - !Storage {component: GlobalBuffer, tensors: [enc_w_key]}
       - !Storage {component: Register, tensors: [enc_w_key]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 128}
+      - !Temporal {rank_variable: enc_hidden, tile_shape: 128}
       - !Compute {component: MAC, einsum: EncKeyProj}
 
     # ----------------------------------------------------------
     # EncValueProj  [3-tensor -> MAC]
-    # enc_input x enc_w_value -> enc_values
+    # enc_input (LocalBuffer, still resident) x enc_w_value -> enc_values
+    # Same corrected loop order as EncQueryProj.
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
       - !Storage {component: LocalBuffer, tensors: [enc_values]}
-      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
       - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
-      - !Temporal {rank_variable: enc_head_dim, tile_shape: 1}
+      - !Temporal {rank_variable: enc_head_dim, tile_shape: 64}
       - !Storage {component: GlobalBuffer, tensors: [enc_w_value]}
       - !Storage {component: Register, tensors: [enc_w_value]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 128}
+      - !Temporal {rank_variable: enc_hidden, tile_shape: 128}
       - !Compute {component: MAC, einsum: EncValueProj}
 
     # ----------------------------------------------------------
     # EncAttentionScores  [3-tensor -> MAC]
-    # enc_queries x enc_keys -> enc_attn_scores
-    # Both inputs resident in LocalBuffer from QKV projs above.
-    # enc_keys plays the weight role here (non-input projected tensor).
+    # enc_queries x enc_keys -> enc_attn_scores [1, 512, 512, 12]
+    #
+    # Reduction dim: enc_head_dim=64 (no tiling needed; fits in PEs).
+    # FIX: enc_head_dim was tile_shape:1 in v2 — added tile_shape:64
+    # so one full head-dimension reduction happens per MAC call.
+    # enc_keys plays weight role (stationary in Register).
+    # Output [512, 512, 12] = 3 MB; enc_seq_len=128 tiles keep the
+    # active output footprint at 128x512x12 = 786 KB < 4 MB LocalBuffer.
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
       - !Storage {component: LocalBuffer, tensors: [enc_attn_scores]}
-      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 128}
       - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
-      - !Temporal {rank_variable: enc_head_dim, tile_shape: 1}
       - !Storage {component: Register, tensors: [enc_keys]}
+      - !Temporal {rank_variable: enc_head_dim, tile_shape: 64}
       - !Compute {component: MAC, einsum: EncAttentionScores}
 
     # ----------------------------------------------------------
     # EncAttentionWeights  [2-tensor -> ScalarUnit]
-    # enc_attn_scores -> enc_attn_weights  (softmax)
+    # softmax: enc_attn_scores -> enc_attn_weights
+    # FIX: tile_shape 1->128 on both dims.
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
       - !Storage {component: LocalBuffer, tensors: [enc_attn_weights]}
-      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 128}
       - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
       - !Compute {component: ScalarUnit, einsum: EncAttentionWeights}
 
     # ----------------------------------------------------------
     # EncAttentionOut  [3-tensor -> MAC]
     # enc_attn_weights x enc_values -> enc_attn_out
-    # enc_values plays the weight role (stationary in Register).
+    #
+    # enc_values is the weight role (stationary in Register).
+    # enc_head_dim is the OUTPUT dim (not reduction!) here —
+    # reduction is over the key enc_seq_len positions.
+    # FIX: enc_head_dim was tile_shape:1 in v2; tile_shape:64
+    # gives full head-dim output per Register load.
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
       - !Storage {component: LocalBuffer, tensors: [enc_attn_out]}
-      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 128}
       - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
-      - !Temporal {rank_variable: enc_head_dim, tile_shape: 1}
       - !Storage {component: Register, tensors: [enc_values]}
+      - !Temporal {rank_variable: enc_head_dim, tile_shape: 64}
       - !Compute {component: MAC, einsum: EncAttentionOut}
 
     # ----------------------------------------------------------
     # EncAttentionProj  [3-tensor -> MAC]
     # enc_attn_out x enc_w_out -> enc_attn_proj
+    #
+    # Contraction (reduction) dims: enc_num_heads x enc_head_dim = 768
+    # Output dim: enc_hidden=768
+    #
+    # FIX v2 had enc_seq_len and enc_hidden ABOVE GlobalBuffer and
+    # enc_num_heads with no reduction tiling, meaning the weight was
+    # reloaded for every (seq, hidden) pair.
+    #
+    # Corrected: enc_hidden (output) above GlobalBuffer so the
+    # weight column [enc_num_heads, enc_head_dim, 128] is loaded
+    # once per output column tile and reused for all seq positions.
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
       - !Storage {component: LocalBuffer, tensors: [enc_attn_proj]}
-      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
-      - !Temporal {rank_variable: enc_hidden, tile_shape: 1}
-      - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
+      - !Temporal {rank_variable: enc_hidden, tile_shape: 128}
       - !Storage {component: GlobalBuffer, tensors: [enc_w_out]}
       - !Storage {component: Register, tensors: [enc_w_out]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 128}
+      - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
+      - !Temporal {rank_variable: enc_head_dim, tile_shape: 64}
       - !Compute {component: MAC, einsum: EncAttentionProj}
 
     # ----------------------------------------------------------
     # EncFfnUp  [3-tensor -> MAC]
     # enc_attn_proj x enc_w_ffn_up -> enc_ffn_hidden
+    #
+    # Weight: [enc_hidden=768, enc_ffn_mid=3072] = 2.25 MB in GlobalBuffer.
+    #
+    # FIX v2 had enc_seq_len and enc_ffn_mid ABOVE GlobalBuffer with
+    # tile_shape:1 — weight was streamed element-by-element with no
+    # spatial or temporal reuse.
+    #
+    # Corrected: enc_ffn_mid=128 column tile ABOVE GlobalBuffer.
+    # The weight column [768, 128] = 96 KB is loaded from GlobalBuffer
+    # once per enc_ffn_mid tile, then reused for all enc_seq_len=128
+    # input rows (reuse_input spatial broadcast).
+    # enc_hidden=128 is the innermost reduction, matching PE width.
+    #
+    # GlobalBuffer reads: (3072/128) = 24 weight column loads.
+    # Each column reused 512/128 = 4 times -> 6x reduction in GB reads
+    # vs v2.
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
       - !Storage {component: LocalBuffer, tensors: [enc_ffn_hidden]}
-      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
-      - !Temporal {rank_variable: enc_ffn_mid, tile_shape: 1}
+      - !Temporal {rank_variable: enc_ffn_mid, tile_shape: 128}
       - !Storage {component: GlobalBuffer, tensors: [enc_w_ffn_up]}
       - !Storage {component: Register, tensors: [enc_w_ffn_up]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 128}
+      - !Temporal {rank_variable: enc_hidden, tile_shape: 128}
       - !Compute {component: MAC, einsum: EncFfnUp}
 
     # ----------------------------------------------------------
     # EncGeluActivation  [2-tensor -> ScalarUnit]
     # enc_ffn_hidden -> enc_ffn_hidden_act
+    # FIX: tile_shape 1->128 on both dims.
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
       - !Storage {component: LocalBuffer, tensors: [enc_ffn_hidden_act]}
-      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
-      - !Temporal {rank_variable: enc_ffn_mid, tile_shape: 1}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 128}
+      - !Temporal {rank_variable: enc_ffn_mid, tile_shape: 128}
       - !Compute {component: ScalarUnit, einsum: EncGeluActivation}
 
     # ----------------------------------------------------------
     # EncFfnDown  [3-tensor -> MAC]
     # enc_ffn_hidden_act x enc_w_ffn_down -> enc_ffn_out
+    #
+    # Weight: [enc_ffn_mid=3072, enc_embed_dim=768] = 2.25 MB.
+    # Output dim: enc_embed_dim=768; Reduction dim: enc_ffn_mid=3072.
+    #
+    # FIX: symmetric to EncFfnUp. enc_embed_dim=128 column tile ABOVE
+    # GlobalBuffer so the weight column [3072, 128] is loaded once
+    # and reused for all enc_seq_len positions.
+    # enc_ffn_mid=128 is the innermost reduction.
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
       - !Storage {component: LocalBuffer, tensors: [enc_ffn_out]}
-      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
-      - !Temporal {rank_variable: enc_embed_dim, tile_shape: 1}
+      - !Temporal {rank_variable: enc_embed_dim, tile_shape: 128}
       - !Storage {component: GlobalBuffer, tensors: [enc_w_ffn_down]}
       - !Storage {component: Register, tensors: [enc_w_ffn_down]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 128}
+      - !Temporal {rank_variable: enc_ffn_mid, tile_shape: 128}
       - !Compute {component: MAC, einsum: EncFfnDown}
 
     # ----------------------------------------------------------
     # ClsPooling  [2-tensor -> ScalarUnit]
-    # enc_ffn_out -> query_embedding  (CLS token pool / mean pool)
-    # enc_ffn_out still in LocalBuffer; query_embedding written to
-    # LocalBuffer and stays fused into FaissScoreComputation below.
+    # enc_ffn_out [batch, enc_seq_len, enc_embed_dim]
+    #   -> query_embedding [batch, enc_embed_dim]
+    # Reduction over enc_seq_len (CLS / mean pool).
+    # FIX: tile_shape 1->128 on both dims.
+    # query_embedding stays in LocalBuffer -> fused into FAISS below.
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
       - !Storage {component: LocalBuffer, tensors: [query_embedding]}
-      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
-      - !Temporal {rank_variable: enc_embed_dim, tile_shape: 1}
+      - !Temporal {rank_variable: enc_embed_dim, tile_shape: 128}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 128}
       - !Compute {component: ScalarUnit, einsum: ClsPooling}
 
     # ----------------------------------------------------------
     # FaissScoreComputation  [3-tensor -> MAC]
     # query_embedding x corpus_embeddings -> doc_scores
     #
-    # KEY TILING: corpus_embeddings is ~1.5GB and must stream.
-    # Outer tile: num_docs=16384 chunks land in GlobalBuffer (16MB each).
-    # Inner enc_embed_dim=128 tile aligns to the 128x128 PE array.
-    # query_embedding is fused: stays in LocalBuffer from ClsPooling.
-    # corpus_embeddings plays the weight role -> Register (stationary).
+    # v2 had this BACKWARDS: query_embedding in Register and
+    # corpus_embeddings routed through GlobalBuffer. But:
+    #   - corpus_embeddings is the WEIGHT role (per renames default:
+    #     weight = ~(input | output)) and must be stationary in Register.
+    #   - query_embedding is the INPUT role and is broadcast.
+    #   - query_embedding is also already resident in LocalBuffer from
+    #     ClsPooling; routing it through Register broke that fusion.
+    #
+    # Corrected: 
+    #   - corpus_embeddings tile [128 docs, 128 embed] in Register
+    #     (weight-stationary, 128 docs x 128 features = 16 KB / tile)
+    #   - query_embedding [128 embed tile] broadcast from LocalBuffer
+    #   - doc_scores [1, 2M] accumulated in GlobalBuffer
+    #   - MainMemory energy here is UNAVOIDABLE: 2M x 768 B = 1.5 GB
+    #     must stream through. num_docs=128 tile aligns to PE height.
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
-      - !Temporal {rank_variable: num_docs, tile_shape: 1}  # fills ~32MB of GlobalBuffer
-      - !Temporal {rank_variable: enc_embed_dim, tile_shape: 128} # reduction tile -> PE width
-      - !Storage {component: GlobalBuffer, tensors: [corpus_embeddings, doc_scores]}
-      - !Temporal {rank_variable: num_docs, tile_shape: 128}     # inner tile -> PE height
-      - !Storage {component: LocalBuffer, tensors: [doc_scores]}
-      - !Storage {component: Register, tensors: [query_embedding]}
+      - !Storage {component: GlobalBuffer, tensors: [doc_scores]}
+      - !Temporal {rank_variable: num_docs, tile_shape: 128}
+      - !Storage {component: LocalBuffer, tensors: [query_embedding]}
+      - !Storage {component: Register, tensors: [corpus_embeddings]}
+      - !Temporal {rank_variable: enc_embed_dim, tile_shape: 128}
       - !Compute {component: MAC, einsum: FaissScoreComputation}
 
     # ----------------------------------------------------------
-    # DocumentGather  [3-tensor -> MAC / scatter]
+    # DocumentGather  [3-tensor -> MAC]
     # topk_doc_ids x corpus_tokens -> topk_tokens
-    # Treated as a gather op; corpus_tokens is the weight tensor.
+    # top_k_docs=10, doc_len=512. Streaming gather from MainMemory.
+    #
+    # FIX: v2 staged corpus_tokens in both GlobalBuffer and Register
+    # with tile_shape:1 — element-by-element gather with no reuse.
+    # Corrected: corpus_tokens streams directly to Register in
+    # doc_len=128 tiles. topk_tokens accumulates in GlobalBuffer.
+    # top_k_docs=1 (only 10 total docs; no benefit to tiling further).
     # ----------------------------------------------------------
     - !Nested
       nodes:
       - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [topk_tokens]}
       - !Temporal {rank_variable: top_k_docs, tile_shape: 1}
-      - !Temporal {rank_variable: doc_len, tile_shape: 1}
-      - !Storage {component: GlobalBuffer, tensors: [corpus_tokens]}
       - !Storage {component: Register, tensors: [corpus_tokens]}
+      - !Temporal {rank_variable: doc_len, tile_shape: 128}
       - !Compute {component: MAC, einsum: DocumentGather}
 
     # ----------------------------------------------------------

@@ -10,6 +10,18 @@ mapping:
   - !Storage
     component: MainMemory
     tensors:
+      - corpus_embeddings
+      - topk_doc_ids
+      - corpus_tokens
+
+  # ============================================================
+  # GlobalBuffer (128MB): weight tiles streamed from MainMemory,
+  # and large intermediate tiles that don't fit in LocalBuffer.
+  # corpus_embeddings tiles land here before inner compute.
+  # ============================================================
+  - !Storage
+    component: GlobalBuffer
+    tensors: 
       - enc_input_raw
       - enc_w_query
       - enc_w_key
@@ -17,9 +29,6 @@ mapping:
       - enc_w_out
       - enc_w_ffn_up
       - enc_w_ffn_down
-      - corpus_embeddings
-      - topk_doc_ids
-      - corpus_tokens
       - dec_w_query
       - dec_w_key
       - dec_w_value
@@ -30,15 +39,6 @@ mapping:
       - doc_scores         # final output of Faiss, persisted
       - topk_tokens        # output of DocumentGather
       - dec_ffn_out        # final decoder output
-
-  # ============================================================
-  # GlobalBuffer (128MB): weight tiles streamed from MainMemory,
-  # and large intermediate tiles that don't fit in LocalBuffer.
-  # corpus_embeddings tiles land here before inner compute.
-  # ============================================================
-  - !Storage
-    component: GlobalBuffer
-    tensors: []
   # ============================================================
   # LocalBuffer (4MB, x4 spatial): on-chip intermediate home.
   # Replaces OnChipSRAM from the reference mapping.
