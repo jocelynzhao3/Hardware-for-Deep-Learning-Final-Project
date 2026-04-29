@@ -1,8 +1,5 @@
 mapping:
   nodes:
-  - !Storage
-    component: Disk
-    tensors: [corpus_tokens]
 
   - !Storage
     component: MainMemory
@@ -27,6 +24,18 @@ mapping:
       - query_embedding
       - doc_scores
       - dec_ffn_out
+      
+  - !Storage
+    component: GlobalBuffer
+    tensors:
+
+  - !Storage
+    component: LocalBuffer
+    tensors:
+
+  - !Storage
+    component: Register
+    tensors:
 
   - !Storage
     component: OnChipSRAM

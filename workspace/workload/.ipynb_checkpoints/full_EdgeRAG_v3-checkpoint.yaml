@@ -22,6 +22,7 @@ workload:
     ENC_FFN_MID: 3072
     ENC_EMBED_DIM: 768
 
+
     # Decoder (Sheared-LLaMA)
     DEC_SEQ_LEN: {{INPUT_TOKENS}}
     # DEC_KV_POS: {{INPUT_TOKENS}}

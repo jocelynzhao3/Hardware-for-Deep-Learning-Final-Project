@@ -1,0 +1,474 @@
+mapping:
+  nodes:
+
+  # ============================================================
+  # MainMemory: persistent weights + final outputs + raw inputs.
+  # Intermediates (enc_*, dec_* activations) are excluded per
+  # tensors: {keep: ~Intermediates} in the arch.
+  # corpus_embeddings (~1.5GB) must live here permanently.
+  # ============================================================
+  - !Storage
+    component: MainMemory
+    tensors:
+      - enc_input_raw
+      - enc_w_query
+      - enc_w_key
+      - enc_w_value
+      - enc_w_out
+      - enc_w_ffn_up
+      - enc_w_ffn_down
+      - corpus_embeddings
+      - topk_doc_ids
+      - corpus_tokens
+      - dec_w_query
+      - dec_w_key
+      - dec_w_value
+      - dec_w_out
+      - dec_w_ffn_gate
+      - dec_w_ffn_up
+      - dec_w_ffn_down
+      - doc_scores         # final output of Faiss, persisted
+      - topk_tokens        # output of DocumentGather
+      - dec_ffn_out        # final decoder output
+
+  # ============================================================
+  # GlobalBuffer (128MB): weight tiles streamed from MainMemory,
+  # and large intermediate tiles that don't fit in LocalBuffer.
+  # corpus_embeddings tiles land here before inner compute.
+  # ============================================================
+  - !Storage
+    component: GlobalBuffer
+    tensors: []
+  # ============================================================
+  # LocalBuffer (4MB, x4 spatial): on-chip intermediate home.
+  # Replaces OnChipSRAM from the reference mapping.
+  # tensors: {keep: input | output} per arch — activations only,
+  # no weights (weights go to Register inside the PE).
+  # ============================================================
+  - !Storage
+    component: LocalBuffer
+    tensors:
+      - enc_input
+      - enc_queries
+      - enc_keys
+      - enc_values
+      - enc_attn_scores
+      - enc_attn_weights
+      - enc_attn_out
+      - enc_attn_proj
+      - enc_ffn_hidden
+      - enc_ffn_hidden_act
+      - enc_ffn_out
+      - dec_input
+      - dec_queries
+      - dec_keys
+      - dec_values
+      - dec_attn_scores
+      - dec_attn_weights
+      - dec_attn_out
+      - dec_attn_proj
+      - dec_ffn_gate
+      - dec_ffn_up
+      - dec_ffn_gate_act
+      - dec_ffn_swiglu
+
+  # ============================================================
+  # Register (1 byte, inside PE): weight-stationary storage.
+  # Declared here at top level; each MAC block below overrides
+  # with the specific weight tensor for that einsum.
+  # ============================================================
+  - !Storage
+    component: Register
+    tensors: []
+
+  - !Sequential
+    nodes:
+
+    # ----------------------------------------------------------
+    # EncInputLoad  [2-tensor -> ScalarUnit]
+    # enc_input_raw -> enc_input
+    # No weight; ScalarUnit handles element-wise copy/cast.
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [enc_input]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_hidden, tile_shape: 1}
+      - !Compute {component: ScalarUnit, einsum: EncInputLoad}
+
+    # ----------------------------------------------------------
+    # EncQueryProj  [3-tensor -> MAC]
+    # enc_input x enc_w_query -> enc_queries
+    # enc_input stays in LocalBuffer from above (fused).
+    # enc_w_query streams GlobalBuffer -> Register.
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [enc_queries]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
+      - !Temporal {rank_variable: enc_head_dim, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [enc_w_query]}
+      - !Storage {component: Register, tensors: [enc_w_query]}
+      - !Compute {component: MAC, einsum: EncQueryProj}
+
+    # ----------------------------------------------------------
+    # EncKeyProj  [3-tensor -> MAC]
+    # enc_input x enc_w_key -> enc_keys
+    # enc_input still resident in LocalBuffer.
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [enc_keys]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
+      - !Temporal {rank_variable: enc_head_dim, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [enc_w_key]}
+      - !Storage {component: Register, tensors: [enc_w_key]}
+      - !Compute {component: MAC, einsum: EncKeyProj}
+
+    # ----------------------------------------------------------
+    # EncValueProj  [3-tensor -> MAC]
+    # enc_input x enc_w_value -> enc_values
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [enc_values]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
+      - !Temporal {rank_variable: enc_head_dim, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [enc_w_value]}
+      - !Storage {component: Register, tensors: [enc_w_value]}
+      - !Compute {component: MAC, einsum: EncValueProj}
+
+    # ----------------------------------------------------------
+    # EncAttentionScores  [3-tensor -> MAC]
+    # enc_queries x enc_keys -> enc_attn_scores
+    # Both inputs resident in LocalBuffer from QKV projs above.
+    # enc_keys plays the weight role here (non-input projected tensor).
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [enc_attn_scores]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
+      - !Temporal {rank_variable: enc_head_dim, tile_shape: 1}
+      - !Storage {component: Register, tensors: [enc_keys]}
+      - !Compute {component: MAC, einsum: EncAttentionScores}
+
+    # ----------------------------------------------------------
+    # EncAttentionWeights  [2-tensor -> ScalarUnit]
+    # enc_attn_scores -> enc_attn_weights  (softmax)
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [enc_attn_weights]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
+      - !Compute {component: ScalarUnit, einsum: EncAttentionWeights}
+
+    # ----------------------------------------------------------
+    # EncAttentionOut  [3-tensor -> MAC]
+    # enc_attn_weights x enc_values -> enc_attn_out
+    # enc_values plays the weight role (stationary in Register).
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [enc_attn_out]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
+      - !Temporal {rank_variable: enc_head_dim, tile_shape: 1}
+      - !Storage {component: Register, tensors: [enc_values]}
+      - !Compute {component: MAC, einsum: EncAttentionOut}
+
+    # ----------------------------------------------------------
+    # EncAttentionProj  [3-tensor -> MAC]
+    # enc_attn_out x enc_w_out -> enc_attn_proj
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [enc_attn_proj]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_hidden, tile_shape: 1}
+      - !Temporal {rank_variable: enc_num_heads, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [enc_w_out]}
+      - !Storage {component: Register, tensors: [enc_w_out]}
+      - !Compute {component: MAC, einsum: EncAttentionProj}
+
+    # ----------------------------------------------------------
+    # EncFfnUp  [3-tensor -> MAC]
+    # enc_attn_proj x enc_w_ffn_up -> enc_ffn_hidden
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [enc_ffn_hidden]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_ffn_mid, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [enc_w_ffn_up]}
+      - !Storage {component: Register, tensors: [enc_w_ffn_up]}
+      - !Compute {component: MAC, einsum: EncFfnUp}
+
+    # ----------------------------------------------------------
+    # EncGeluActivation  [2-tensor -> ScalarUnit]
+    # enc_ffn_hidden -> enc_ffn_hidden_act
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [enc_ffn_hidden_act]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_ffn_mid, tile_shape: 1}
+      - !Compute {component: ScalarUnit, einsum: EncGeluActivation}
+
+    # ----------------------------------------------------------
+    # EncFfnDown  [3-tensor -> MAC]
+    # enc_ffn_hidden_act x enc_w_ffn_down -> enc_ffn_out
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [enc_ffn_out]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_embed_dim, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [enc_w_ffn_down]}
+      - !Storage {component: Register, tensors: [enc_w_ffn_down]}
+      - !Compute {component: MAC, einsum: EncFfnDown}
+
+    # ----------------------------------------------------------
+    # ClsPooling  [2-tensor -> ScalarUnit]
+    # enc_ffn_out -> query_embedding  (CLS token pool / mean pool)
+    # enc_ffn_out still in LocalBuffer; query_embedding written to
+    # LocalBuffer and stays fused into FaissScoreComputation below.
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [query_embedding]}
+      - !Temporal {rank_variable: enc_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: enc_embed_dim, tile_shape: 1}
+      - !Compute {component: ScalarUnit, einsum: ClsPooling}
+
+    # ----------------------------------------------------------
+    # FaissScoreComputation  [3-tensor -> MAC]
+    # query_embedding x corpus_embeddings -> doc_scores
+    #
+    # KEY TILING: corpus_embeddings is ~1.5GB and must stream.
+    # Outer tile: num_docs=16384 chunks land in GlobalBuffer (16MB each).
+    # Inner enc_embed_dim=128 tile aligns to the 128x128 PE array.
+    # query_embedding is fused: stays in LocalBuffer from ClsPooling.
+    # corpus_embeddings plays the weight role -> Register (stationary).
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Temporal {rank_variable: num_docs, tile_shape: 1}  # fills ~32MB of GlobalBuffer
+      - !Temporal {rank_variable: enc_embed_dim, tile_shape: 128} # reduction tile -> PE width
+      - !Storage {component: GlobalBuffer, tensors: [corpus_embeddings, doc_scores]}
+      - !Temporal {rank_variable: num_docs, tile_shape: 128}     # inner tile -> PE height
+      - !Storage {component: LocalBuffer, tensors: [doc_scores]}
+      - !Storage {component: Register, tensors: [query_embedding]}
+      - !Compute {component: MAC, einsum: FaissScoreComputation}
+
+    # ----------------------------------------------------------
+    # DocumentGather  [3-tensor -> MAC / scatter]
+    # topk_doc_ids x corpus_tokens -> topk_tokens
+    # Treated as a gather op; corpus_tokens is the weight tensor.
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Temporal {rank_variable: top_k_docs, tile_shape: 1}
+      - !Temporal {rank_variable: doc_len, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [corpus_tokens]}
+      - !Storage {component: Register, tensors: [corpus_tokens]}
+      - !Compute {component: MAC, einsum: DocumentGather}
+
+    # ----------------------------------------------------------
+    # DecoderInputLoad  [2-tensor -> ScalarUnit]
+    # dec_input_raw -> dec_input
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [dec_input]}
+      - !Temporal {rank_variable: dec_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: dec_hidden, tile_shape: 1}
+      - !Compute {component: ScalarUnit, einsum: DecoderInputLoad}
+
+    # ----------------------------------------------------------
+    # DecQueryProj  [3-tensor -> MAC]
+    # dec_input x dec_w_query -> dec_queries
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [dec_queries]}
+      - !Temporal {rank_variable: dec_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: dec_num_heads, tile_shape: 1}
+      - !Temporal {rank_variable: dec_head_dim, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [dec_w_query]}
+      - !Storage {component: Register, tensors: [dec_w_query]}
+      - !Compute {component: MAC, einsum: DecQueryProj}
+
+    # ----------------------------------------------------------
+    # DecKeyProj  [3-tensor -> MAC]
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [dec_keys]}
+      - !Temporal {rank_variable: dec_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: dec_num_heads, tile_shape: 1}
+      - !Temporal {rank_variable: dec_head_dim, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [dec_w_key]}
+      - !Storage {component: Register, tensors: [dec_w_key]}
+      - !Compute {component: MAC, einsum: DecKeyProj}
+
+    # ----------------------------------------------------------
+    # DecValueProj  [3-tensor -> MAC]
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [dec_values]}
+      - !Temporal {rank_variable: dec_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: dec_num_heads, tile_shape: 1}
+      - !Temporal {rank_variable: dec_head_dim, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [dec_w_value]}
+      - !Storage {component: Register, tensors: [dec_w_value]}
+      - !Compute {component: MAC, einsum: DecValueProj}
+
+    # ----------------------------------------------------------
+    # DecAttentionScores  [3-tensor -> MAC]
+    # dec_queries x dec_keys -> dec_attn_scores
+    # dec_keys stationary in Register.
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [dec_attn_scores]}
+      - !Temporal {rank_variable: dec_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: dec_num_heads, tile_shape: 1}
+      - !Temporal {rank_variable: dec_head_dim, tile_shape: 1}
+      - !Storage {component: Register, tensors: [dec_keys]}
+      - !Compute {component: MAC, einsum: DecAttentionScores}
+
+    # ----------------------------------------------------------
+    # DecAttentionWeights  [2-tensor -> ScalarUnit]
+    # dec_attn_scores -> dec_attn_weights  (softmax)
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [dec_attn_weights]}
+      - !Temporal {rank_variable: dec_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: dec_num_heads, tile_shape: 1}
+      - !Compute {component: ScalarUnit, einsum: DecAttentionWeights}
+
+    # ----------------------------------------------------------
+    # DecAttentionOut  [3-tensor -> MAC]
+    # dec_attn_weights x dec_values -> dec_attn_out
+    # dec_values stationary in Register.
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [dec_attn_out]}
+      - !Temporal {rank_variable: dec_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: dec_num_heads, tile_shape: 1}
+      - !Temporal {rank_variable: dec_head_dim, tile_shape: 1}
+      - !Storage {component: Register, tensors: [dec_values]}
+      - !Compute {component: MAC, einsum: DecAttentionOut}
+
+    # ----------------------------------------------------------
+    # DecAttentionProj  [3-tensor -> MAC]
+    # dec_attn_out x dec_w_out -> dec_attn_proj
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [dec_attn_proj]}
+      - !Temporal {rank_variable: dec_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: dec_hidden, tile_shape: 1}
+      - !Temporal {rank_variable: dec_num_heads, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [dec_w_out]}
+      - !Storage {component: Register, tensors: [dec_w_out]}
+      - !Compute {component: MAC, einsum: DecAttentionProj}
+
+    # ----------------------------------------------------------
+    # DecFfnGate  [3-tensor -> MAC]
+    # dec_attn_proj x dec_w_ffn_gate -> dec_ffn_gate
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [dec_ffn_gate]}
+      - !Temporal {rank_variable: dec_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: dec_ffn_mid, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [dec_w_ffn_gate]}
+      - !Storage {component: Register, tensors: [dec_w_ffn_gate]}
+      - !Compute {component: MAC, einsum: DecFfnGate}
+
+    # ----------------------------------------------------------
+    # DecFfnUp  [3-tensor -> MAC]
+    # dec_attn_proj x dec_w_ffn_up -> dec_ffn_up
+    # dec_attn_proj still resident in LocalBuffer (fused with Gate).
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [dec_ffn_up]}
+      - !Temporal {rank_variable: dec_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: dec_ffn_mid, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [dec_w_ffn_up]}
+      - !Storage {component: Register, tensors: [dec_w_ffn_up]}
+      - !Compute {component: MAC, einsum: DecFfnUp}
+
+    # ----------------------------------------------------------
+    # DecFfnGateAct  [2-tensor -> ScalarUnit]
+    # dec_ffn_gate -> dec_ffn_gate_act  (SiLU activation)
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [dec_ffn_gate_act]}
+      - !Temporal {rank_variable: dec_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: dec_ffn_mid, tile_shape: 1}
+      - !Compute {component: ScalarUnit, einsum: DecFfnGateAct}
+
+    # ----------------------------------------------------------
+    # SwigluElementwiseMult  [3-tensor -> MAC]
+    # dec_ffn_gate_act x dec_ffn_up -> dec_ffn_swiglu
+    # Both inputs resident in LocalBuffer (fused from above).
+    # dec_ffn_up plays the weight role -> Register.
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Storage {component: LocalBuffer, tensors: [dec_ffn_swiglu]}
+      - !Temporal {rank_variable: dec_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: dec_ffn_mid, tile_shape: 1}
+      - !Storage {component: Register, tensors: [dec_ffn_up]}
+      - !Compute {component: MAC, einsum: SwigluElementwiseMult}
+
+    # ----------------------------------------------------------
+    # DecFfnDown  [3-tensor -> MAC]
+    # dec_ffn_swiglu x dec_w_ffn_down -> dec_ffn_out
+    # ----------------------------------------------------------
+    - !Nested
+      nodes:
+      - !Temporal {rank_variable: batch, tile_shape: 1}
+      - !Temporal {rank_variable: dec_seq_len, tile_shape: 1}
+      - !Temporal {rank_variable: dec_hidden, tile_shape: 1}
+      - !Storage {component: GlobalBuffer, tensors: [dec_w_ffn_down]}
+      - !Storage {component: Register, tensors: [dec_w_ffn_down]}
+      - !Compute {component: MAC, einsum: DecFfnDown}

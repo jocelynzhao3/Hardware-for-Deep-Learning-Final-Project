@@ -60,7 +60,7 @@ arch:
 
   - !Memory
     name: Register
-    size: 8
+    size: 8 # 1 byte or 8 bits?
     area: 8.5e-11 # Fig. 6 has 14mm^2 for a 128x128. Assume regs are 10%.
     leak_power: 0
     actions:
