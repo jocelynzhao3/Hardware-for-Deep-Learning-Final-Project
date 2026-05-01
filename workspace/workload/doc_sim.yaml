@@ -1,0 +1,58 @@
+workload:
+  rank_sizes:
+    # Use Jinja2 defaults as defined in your original file
+    {% set N_TOKENS = N_TOKENS | default(512) %}
+    {% set N_DOCS = N_DOCS | default(2_000_000)%}
+    {% set K = K | default(10) %}
+    {% set L = L | default(512) %}
+    {% set BATCH_SIZE = BATCH_SIZE | default(1) %} # tried 100
+    {% set INPUT_TOKENS = INPUT_TOKENS | default(N_TOKENS + K * L) %}
+
+    BATCH: {{BATCH_SIZE}}
+    NUM_DOCS: {{N_DOCS}}
+    TOP_K_DOCS: {{K}}
+    DOC_LEN: {{L}}
+
+    # # Encoder (GTE)
+    # ENC_SEQ_LEN: {{N_TOKENS}}
+    # # ENC_KV_POS: {{N_TOKENS}}
+    # ENC_NUM_HEADS: 12
+    # ENC_HEAD_DIM: 64
+    # ENC_HIDDEN: 768
+    # ENC_FFN_MID: 3072
+    ENC_EMBED_DIM: 768
+
+
+    # # Decoder (Sheared-LLaMA)
+    # DEC_SEQ_LEN: {{INPUT_TOKENS}}
+    # # DEC_KV_POS: {{INPUT_TOKENS}}
+    # DEC_NUM_HEADS: 20
+    # DEC_HEAD_DIM: 128
+    # DEC_HIDDEN: 2560
+    # DEC_FFN_MID: 6912
+    # DEC_VOCAB: 32000
+
+  bits_per_value: {All: 8}
+  persistent_tensors: weight - Intermediates
+
+  einsums:
+    - name: DocumentSimilarity
+      tensor_accesses:
+        - {name: query_embedding, projection: [batch, enc_embed_dim]}
+        - {name: corpus_embeddings, projection: [num_docs, enc_embed_dim]}
+        - {name: doc_scores, projection: [batch, num_docs], output: True}
+      renames: {input: query_embedding}
+
+renames:
+  einsums:
+    - name: default
+      tensor_accesses:
+        - name: input
+          source: Inputs & Intermediates if len(All) == 3 else Inputs
+          expected_count: 1
+        - name: output
+          source: Outputs
+          expected_count: 1
+        - name: weight
+          source: ~(input | output)
+          expected_count: 1 if len(All) == 3 else 0

@@ -5,7 +5,7 @@ workload:
     {% set N_DOCS = N_DOCS | default(2_000_000)%}
     {% set K = K | default(10) %}
     {% set L = L | default(512) %}
-    {% set BATCH_SIZE = BATCH_SIZE | default(1) %}
+    {% set BATCH_SIZE = BATCH_SIZE | default(1) %} # tried 100
     {% set INPUT_TOKENS = INPUT_TOKENS | default(N_TOKENS + K * L) %}
 
     BATCH: {{BATCH_SIZE}}
@@ -33,7 +33,7 @@ workload:
     DEC_VOCAB: 32000
 
   bits_per_value: {All: 8}
-  # persistent_tensors: weight - Intermediates
+  persistent_tensors: weight - Intermediates
 
   einsums:
     - name: EncInputLoad
@@ -113,10 +113,10 @@ workload:
         - {name: enc_ffn_out, projection: [batch, enc_seq_len, enc_embed_dim]}
         - {name: query_embedding, projection: [batch, enc_embed_dim], output: True}
 
-    - name: FaissScoreComputation
+    - name: DocumentSimilarity
       tensor_accesses:
-        - {name: query_embedding, projection: [batch, enc_embed_dim]}
-        - {name: corpus_embeddings, projection: [num_docs, enc_embed_dim]}
+        - {name: query_embedding, projection: [batch, enc_embed_dim]} # 100, 768
+        - {name: corpus_embeddings, projection: [num_docs, enc_embed_dim]}  # 2M, 768
         - {name: doc_scores, projection: [batch, num_docs], output: True}
       renames: {input: query_embedding}
 

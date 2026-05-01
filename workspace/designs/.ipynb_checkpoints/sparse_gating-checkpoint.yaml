@@ -1,0 +1,7 @@
+sparse_optimizations:
+  targets:
+  - target: MAC
+    compute_optimization:
+    - kind: gating
+      target: Z
+      condition_on: [A, B]

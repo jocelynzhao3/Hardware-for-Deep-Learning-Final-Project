@@ -1,0 +1,68 @@
+# TODO make sparse!
+workload:
+  rank_sizes:
+    # Use Jinja2 defaults as defined in your original file
+    {% set N_TOKENS = N_TOKENS | default(512) %}
+    {% set N_DOCS = N_DOCS | default(2_000_000)%} # sweep over this value
+    {% set K = K | default(10) %}
+    {% set L = L | default(512) %}
+    {% set BATCH_SIZE = BATCH_SIZE | default(1) %}
+    {% set INPUT_TOKENS = INPUT_TOKENS | default(N_TOKENS + K * L) %}
+    {% set SMALL_EMBED_DIM = SMALL_EMBED_DIM | default(128) %}
+    {% set TOP_LARGE_K_DOCS = TOP_LARGE_K_DOCS | default(100) %}
+
+    BATCH: {{BATCH_SIZE}}
+    NUM_DOCS: {{N_DOCS}}
+    TOP_K_DOCS: {{K}}
+    DOC_LEN: {{L}}
+    SMALL_EMBED_DIM: {{SMALL_EMBED_DIM}}
+    TOP_LARGE_K_DOCS: {{TOP_LARGE_K_DOCS}}
+
+    # Encoder (GTE)
+    ENC_SEQ_LEN: {{N_TOKENS}}
+    # ENC_KV_POS: {{N_TOKENS}}
+    ENC_NUM_HEADS: 12
+    ENC_HEAD_DIM: 64
+    ENC_HIDDEN: 768
+    ENC_FFN_MID: 3072
+    ENC_EMBED_DIM: 768
+
+  bits_per_value: {All: 8}
+  persistent_tensors: weight - Intermediates
+
+  einsums:
+
+    - name: Projection # project the query down
+      tensor_accesses:
+        - {name: query_embedding, projection: [batch, enc_embed_dim]}
+        - {name: projection_matrix, projection: [enc_embed_dim, small_embed_dim]}
+        - {name: query_embedding_low, projection: [batch, small_embed_dim], output: True}
+      renames: {input: query_embedding}
+
+    - name: CoarseScoreComputation
+      tensor_accesses:
+        - {name: query_embedding_low, projection: [batch, small_embed_dim]}
+        - {name: corpus_embeddings_low, projection: [num_docs, small_embed_dim]}
+        - {name: coarse_scores, projection: [batch, num_docs], output: True}
+      renames: {input: query_embedding_low}
+
+    - name: FineScoreComputation
+      tensor_accesses:
+        - {name: query_embedding, projection: [batch, enc_embed_dim], density: 1.0}
+        - {name: corpus_embeddings, projection: [num_docs, enc_embed_dim], density: 0.00005} # sparse, 100/2_000_000 = 0.00005
+        - {name: doc_scores, projection: [batch, num_docs], output: True}
+      renames: {input: query_embedding}
+
+renames:
+  einsums:
+    - name: default
+      tensor_accesses:
+        - name: input
+          source: Inputs & Intermediates if len(All) == 3 else Inputs
+          expected_count: 1
+        - name: output
+          source: Outputs
+          expected_count: 1
+        - name: weight
+          source: ~(input | output)
+          expected_count: 1 if len(All) == 3 else 0

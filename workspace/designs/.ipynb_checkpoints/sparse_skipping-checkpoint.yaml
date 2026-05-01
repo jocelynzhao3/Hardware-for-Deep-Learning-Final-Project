@@ -1,0 +1,23 @@
+sparse_optimizations:
+  targets:
+  - target: DRAM
+    representation_format:
+    - name: A
+      format: csr
+      metadata_word_bits: 4
+    - name: B
+      format: csr
+      metadata_word_bits: 4
+  - target: Buffer
+    representation_format:
+    - name: A
+      format: csr
+      metadata_word_bits: 4
+    - name: B
+      format: csr
+      metadata_word_bits: 4
+  - target: MAC
+    compute_optimization:
+    - kind: skipping
+      target: Z
+      condition_on: [A, B]

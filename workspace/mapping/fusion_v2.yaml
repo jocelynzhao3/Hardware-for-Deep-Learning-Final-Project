@@ -10,9 +10,33 @@ mapping:
   - !Storage
     component: MainMemory
     tensors:
-      - corpus_embeddings
-      - topk_doc_ids
+      - enc_input_raw
+      - enc_w_query
+      - enc_w_key
+      - enc_w_value
+      - enc_w_out
+      - enc_w_ffn_up
+      - enc_w_ffn_down
       - corpus_tokens
+
+      - topk_tokens        # output of DocumentGather
+      - topk_doc_ids
+      
+      - dec_input_raw
+      - dec_w_query
+      - dec_w_key
+      - dec_w_value
+      - dec_w_out
+      - dec_w_ffn_gate
+      - dec_w_ffn_up
+      - dec_w_ffn_down
+      - dec_ffn_gate
+      - dec_ffn_out        # final decoder output
+      
+      - doc_scores         # final output of Faiss, persisted
+      - corpus_embeddings
+
+
 
   # ============================================================
   # GlobalBuffer (128MB): weight tiles streamed from MainMemory,
@@ -22,23 +46,14 @@ mapping:
   - !Storage
     component: GlobalBuffer
     tensors: 
-      - enc_input_raw
-      - enc_w_query
-      - enc_w_key
-      - enc_w_value
-      - enc_w_out
-      - enc_w_ffn_up
-      - enc_w_ffn_down
-      - dec_w_query
-      - dec_w_key
-      - dec_w_value
-      - dec_w_out
-      - dec_w_ffn_gate
-      - dec_w_ffn_up
-      - dec_w_ffn_down
-      - doc_scores         # final output of Faiss, persisted
-      - topk_tokens        # output of DocumentGather
-      - dec_ffn_out        # final decoder output
+      - enc_attn_out
+      - enc_attn_proj
+      - enc_ffn_hidden
+      - enc_ffn_hidden_act
+      - enc_ffn_out
+      - query_embedding
+      - doc_scores
+
   # ============================================================
   # LocalBuffer (4MB, x4 spatial): on-chip intermediate home.
   # Replaces OnChipSRAM from the reference mapping.
@@ -54,11 +69,6 @@ mapping:
       - enc_values
       - enc_attn_scores
       - enc_attn_weights
-      - enc_attn_out
-      - enc_attn_proj
-      - enc_ffn_hidden
-      - enc_ffn_hidden_act
-      - enc_ffn_out
       - dec_input
       - dec_queries
       - dec_keys
@@ -67,7 +77,6 @@ mapping:
       - dec_attn_weights
       - dec_attn_out
       - dec_attn_proj
-      - dec_ffn_gate
       - dec_ffn_up
       - dec_ffn_gate_act
       - dec_ffn_swiglu
@@ -269,14 +278,67 @@ mapping:
     # ----------------------------------------------------------
     - !Nested
       nodes:
-      - !Temporal {rank_variable: batch, tile_shape: 1}
-      - !Temporal {rank_variable: num_docs, tile_shape: 1}  # fills ~32MB of GlobalBuffer
-      - !Temporal {rank_variable: enc_embed_dim, tile_shape: 128} # reduction tile -> PE width
-      - !Storage {component: GlobalBuffer, tensors: [corpus_embeddings, doc_scores]}
-      - !Temporal {rank_variable: num_docs, tile_shape: 128}     # inner tile -> PE height
-      - !Storage {component: LocalBuffer, tensors: [doc_scores]}
-      - !Storage {component: Register, tensors: [query_embedding]}
-      - !Compute {component: MAC, einsum: FaissScoreComputation}
+      # - !Temporal {rank_variable: batch, tile_shape: 1}
+      # - !Temporal {rank_variable: num_docs, tile_shape: 1}  # fills ~32MB of GlobalBuffer
+      # - !Temporal {rank_variable: enc_embed_dim, tile_shape: 128} # reduction tile -> PE width
+      # - !Storage {component: GlobalBuffer, tensors: [corpus_embeddings, doc_scores]}
+      # - !Temporal {rank_variable: num_docs, tile_shape: 128}     # inner tile -> PE height
+      # - !Storage {component: LocalBuffer, tensors: [doc_scores]}
+      # - !Storage {component: Register, tensors: [query_embedding]}
+      # - !Compute {component: MAC, einsum: FaissScoreComputation}
+      - !Storage
+        tensors: [doc_scores, corpus_embeddings, query_embedding]
+        component: MainMemory
+    
+      - !Temporal
+        rank_variable: num_docs
+        tile_shape: 80000
+    
+      - !Storage
+        tensors: [query_embedding]
+        component: GlobalBuffer
+    
+      - !Spatial
+        rank_variable: batch
+        tile_shape: 25
+        name: Z
+        component: LocalBuffer
+    
+      - !Storage
+        tensors: [doc_scores, query_embedding]
+        component: LocalBuffer
+    
+      - !Temporal
+        rank_variable: enc_embed_dim
+        tile_shape: 128
+    
+      - !Temporal
+        rank_variable: num_docs
+        tile_shape: 128
+    
+      - !Spatial
+        rank_variable: enc_embed_dim
+        tile_shape: 1
+        name: reuse_output
+        component: ProcessingElement
+    
+      - !Spatial
+        rank_variable: num_docs
+        tile_shape: 1
+        name: reuse_input
+        component: ProcessingElement
+    
+      - !Storage
+        tensors: [corpus_embeddings]
+        component: Register
+    
+      - !Temporal
+        rank_variable: batch
+        tile_shape: 1
+    
+      - !Compute
+        einsum: FaissScoreComputation
+        component: MAC
 
     # ----------------------------------------------------------
     # DocumentGather  [3-tensor -> MAC / scatter]

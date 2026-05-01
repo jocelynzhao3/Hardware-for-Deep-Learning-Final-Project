@@ -5,13 +5,18 @@ workload:
     {% set N_DOCS = N_DOCS | default(2_000_000)%}
     {% set K = K | default(10) %}
     {% set L = L | default(512) %}
-    {% set BATCH_SIZE = BATCH_SIZE | default(1) %} # tried 100
+    {% set BATCH_SIZE = BATCH_SIZE | default(1) %}
     {% set INPUT_TOKENS = INPUT_TOKENS | default(N_TOKENS + K * L) %}
+    
+    {% set SMALL_EMBED_DIM = SMALL_EMBED_DIM | default(128) %}
+    {% set TOP_LARGE_K_DOCS = TOP_LARGE_K_DOCS | default(100) %}
 
     BATCH: {{BATCH_SIZE}}
     NUM_DOCS: {{N_DOCS}}
     TOP_K_DOCS: {{K}}
     DOC_LEN: {{L}}
+    SMALL_EMBED_DIM: {{SMALL_EMBED_DIM}}
+    TOP_LARGE_K_DOCS: {{TOP_LARGE_K_DOCS}}
 
     # Encoder (GTE)
     ENC_SEQ_LEN: {{N_TOKENS}}
@@ -113,10 +118,33 @@ workload:
         - {name: enc_ffn_out, projection: [batch, enc_seq_len, enc_embed_dim]}
         - {name: query_embedding, projection: [batch, enc_embed_dim], output: True}
 
-    - name: DocumentSimilarity
+    # - name: FaissScoreComputation
+    #   tensor_accesses:
+    #     - {name: query_embedding, projection: [batch, enc_embed_dim]}
+    #     - {name: corpus_embeddings, projection: [num_docs, enc_embed_dim]}
+    #     - {name: doc_scores, projection: [batch, num_docs], output: True}
+    #   renames: {input: query_embedding}
+
+    - name: Projection # project the query down
       tensor_accesses:
-        - {name: query_embedding, projection: [batch, enc_embed_dim]} # 100, 768
-        - {name: corpus_embeddings, projection: [num_docs, enc_embed_dim]}  # 2M, 768
+        - {name: query_embedding, projection: [batch, enc_embed_dim]}
+        - {name: projection_matrix, projection: [enc_embed_dim, small_embed_dim]}  
+        - {name: query_embedding_low, projection: [batch, small_embed_dim], output: True}
+      renames: {input: query_embedding}
+
+    - name: CoarseScoreComputation
+      tensor_accesses:
+        - {name: query_embedding_low, projection: [batch, small_embed_dim]}
+        - {name: corpus_embeddings_low, projection: [num_docs, small_embed_dim]}
+        - {name: coarse_scores, projection: [batch, num_docs], output: True}
+      renames: {input: query_embedding_low}
+
+    # TODO set top_k_candidates
+
+    - name: FineScoreComputation
+      tensor_accesses:
+        - {name: query_embedding, projection: [batch, enc_embed_dim]} 
+        - {name: corpus_embeddings, projection: [num_docs, enc_embed_dim], density: 100/2_000_000}
         - {name: doc_scores, projection: [batch, num_docs], output: True}
       renames: {input: query_embedding}
 
@@ -126,6 +154,8 @@ workload:
         - {name: corpus_tokens, projection: [top_k_docs, doc_len]}
         - {name: topk_tokens, projection: [batch, top_k_docs, doc_len], output: True}
       renames: {input: topk_doc_ids}
+
+      
 
     - name: DecoderInputLoad # changed, matches Accelforge example and encoder input
       tensor_accesses:

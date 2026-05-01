@@ -1,0 +1,14 @@
+sparse_optimizations:
+  targets:
+  - target: DRAM
+    representation_format:
+    - {name: A, format: csr, metadata_word_bits: 2}
+  - target: Buffer
+    representation_format:
+    - {name: A, format: csr, metadata_word_bits: 2}
+    action_optimization:
+    - {kind: skipping, target: B, condition_on: [A]}
+    - {kind: skipping, target: Z, condition_on: [A]}
+  - target: MAC
+    compute_optimization:
+    - {kind: skipping, target: Z, condition_on: [A]}

@@ -25,23 +25,7 @@ mapping:
   # ============================================================
   - !Storage
     component: GlobalBuffer
-    tensors:
-      - enc_w_query
-      - enc_w_key
-      - enc_w_value
-      - enc_w_out
-      - enc_w_ffn_up
-      - enc_w_ffn_down
-      - dec_w_query
-      - dec_w_key
-      - dec_w_value
-      - dec_w_out
-      - dec_w_ffn_gate
-      - dec_w_ffn_up
-      - dec_w_ffn_down
-      - doc_scores         # [1, 2M] = 2 MB, final output of FAISS
-      - topk_tokens        # output of DocumentGather
-      - dec_ffn_out        # final decoder output
+    tensors: []
 
   # ============================================================
   # LocalBuffer (4MB, x4 spatial): on-chip intermediates.

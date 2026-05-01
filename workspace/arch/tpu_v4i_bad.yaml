@@ -18,7 +18,7 @@ arch:
       # reference, and they said it left out some things.
     - {name: read, energy: 7.03e-12, latency: 1 / (8 * 614e9)}
     - {name: write, energy: 7.03e-12, latency: 1 / (8 * 614e9)}
-    tensors: {keep: ~Intermediates, may_keep: All}
+    tensors: {keep: All} # forcing the mapper to be stupid and put everything back to DRAM
 
   - !Memory
     name: GlobalBuffer
@@ -29,7 +29,7 @@ arch:
     actions:
     - {name: read, energy: 1.88e-12, latency: 1 / (8 * 2048e9)}
     - {name: write, energy: 2.36e-12, latency: 1 / (8 * 1024e9)}
-    tensors: {keep: ~MainMemory.tensors, may_keep: All}
+    tensors: {keep: ~Intermediates, may_keep: All}
 
   - !Memory
     name: LocalBuffer
@@ -40,7 +40,7 @@ arch:
     actions:
     - {name: read, energy: 0.249e-12, latency: 0}
     - {name: write, energy: 0.293e-12, latency: 0}
-    tensors: {keep: input | output}
+    tensors: {keep: Intermediates}
 
     # will do the job for 2-einsums
   - !Compute
@@ -75,8 +75,3 @@ arch:
     actions:
     - {name: compute, energy: 0.084e-12, latency: 1 / 1.05e9}
     enabled: len(All) == 3
-
-
-compute:         0.084e-12
-gated_compute:   ~0.008–0.02e-12
-skipped_compute: 0

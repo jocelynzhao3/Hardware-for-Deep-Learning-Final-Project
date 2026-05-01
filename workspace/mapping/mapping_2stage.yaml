@@ -1,0 +1,154 @@
+mapping:
+  nodes:
+  # Top-level: all tensors enter from MainMemory
+  - !Storage
+    tensors: [projection_matrix, corpus_embeddings_low, corpus_embeddings, query_embedding]
+    component: MainMemory
+
+  # query_embedding_low is produced/reused at GlobalBuffer level
+  - !Storage
+    tensors: [query_embedding_low]
+    component: GlobalBuffer
+
+  # # Weights/corpora stay in MainMemory (reserved, not passed further down jointly)
+  # - !Storage
+  #   tensors: [projection_matrix, corpus_embeddings_low, corpus_embeddings]
+  #   component: MainMemory
+
+  # Three einsums computed sequentially, each in its own Nested branch
+  - !Sequential
+    nodes:
+
+    # ── Branch 1: Projection ──────────────────────────────────────────────────
+    - !Nested
+      nodes:
+      # - !Storage
+      #   tensors: [query_embedding]
+      #   component: MainMemory
+      # - !Storage
+      #   tensors: [query_embedding_low]
+      #   component: GlobalBuffer
+      # Spatial Z fanout over enc_embed_dim (fanout=4, tile=256 → covers 768 hidden dim)
+      - !Spatial
+        rank_variable: enc_embed_dim
+        tile_shape: 256
+        name: Z
+        component: LocalBuffer
+      - !Storage
+        tensors: [query_embedding, query_embedding_low]
+        component: LocalBuffer
+      # Temporal tiling of enc_embed_dim within each Z slice
+      - !Temporal
+        rank_variable: enc_embed_dim
+        tile_shape: 128
+      # Spatial reuse_output: each PE column accumulates output (enc_embed_dim → small_embed_dim)
+      - !Spatial
+        rank_variable: enc_embed_dim
+        tile_shape: 1
+        name: reuse_output
+        component: ProcessingElement
+      # Spatial reuse_input: each PE row shares the same query input
+      - !Spatial
+        rank_variable: small_embed_dim
+        tile_shape: 1
+        name: reuse_input
+        component: ProcessingElement
+      - !Storage
+        tensors: [projection_matrix]
+        component: Register
+      - !Compute
+        einsum: Projection
+        component: MAC
+
+    # ── Branch 2: CoarseScoreComputation ─────────────────────────────────────
+    - !Nested
+      nodes:
+      # Output (coarse_scores) streams back to MainMemory
+      - !Storage
+        tensors: [coarse_scores]
+        component: MainMemory
+      # Both scores and query_embedding_low buffered in LocalBuffer
+      - !Storage
+        tensors: [coarse_scores, query_embedding_low]
+        component: LocalBuffer
+      # query_embedding stays in MainMemory (not needed deeper)
+      # - !Storage
+      #   tensors: [query_embedding]
+      #   component: MainMemory
+      # # GlobalBuffer holds query_embedding_low for reuse across num_docs tiles
+      # - !Storage
+      #   tensors: [query_embedding_low]
+      #   component: GlobalBuffer
+      # Temporal tiling over num_docs dimension
+      - !Temporal
+        rank_variable: num_docs
+        tile_shape: 128
+      # Spatial reuse_output: each PE column accumulates score over small_embed_dim
+      - !Spatial
+        rank_variable: small_embed_dim
+        tile_shape: 1
+        name: reuse_output
+        component: ProcessingElement
+      # Spatial reuse_input: each PE row streams different corpus docs
+      - !Spatial
+        rank_variable: num_docs
+        tile_shape: 1
+        name: reuse_input
+        component: ProcessingElement
+      - !Storage
+        tensors: [corpus_embeddings_low]
+        component: Register
+      - !Compute
+        einsum: CoarseScoreComputation
+        component: MAC
+
+    # ── Branch 3: FineScoreComputation ───────────────────────────────────────
+    - !Nested
+      nodes:
+      # doc_scores output accumulated back to MainMemory
+      - !Storage
+        tensors: [doc_scores]
+        component: MainMemory
+      # query_embedding and doc_scores both reserved at MainMemory for this einsum
+      # - !Storage
+      #   tensors: [query_embedding, doc_scores]
+      #   component: MainMemory
+      # Spatial Z over enc_embed_dim (same as Projection branch)
+      - !Spatial
+        rank_variable: enc_embed_dim
+        tile_shape: 256
+        name: Z
+        component: LocalBuffer
+      - !Storage
+        tensors: [doc_scores]
+        component: LocalBuffer
+      # Temporal tiling of enc_embed_dim
+      - !Temporal
+        rank_variable: enc_embed_dim
+        tile_shape: 128
+      # query_embedding buffered in LocalBuffer for reuse across num_docs
+      - !Storage
+        tensors: [query_embedding]
+        component: LocalBuffer
+      # Temporal tiling over (sparse) num_docs dimension
+      - !Temporal
+        rank_variable: num_docs
+        tile_shape: 128
+      # Spatial reuse_output: each PE column accumulates over enc_embed_dim
+      - !Spatial
+        rank_variable: enc_embed_dim
+        tile_shape: 1
+        name: reuse_output
+        component: ProcessingElement
+      # Spatial reuse_input: each PE row streams different corpus docs
+      - !Spatial
+        rank_variable: num_docs
+        tile_shape: 1
+        name: reuse_input
+        component: ProcessingElement
+      - !Storage
+        tensors: [corpus_embeddings]
+        component: Register
+      - !Compute
+        einsum: FineScoreComputation
+        component: MAC

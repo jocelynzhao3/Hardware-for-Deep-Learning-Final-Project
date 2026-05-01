@@ -1,0 +1,20 @@
+mapping:
+  nodes:
+  - !Storage
+    tensors: [A, B, Z]
+    component: DRAM
+  - !Storage
+    tensors: [A, B, Z]
+    component: Buffer
+  - !Temporal
+    rank_variable: n
+    tile_shape: 1
+  - !Temporal
+    rank_variable: k
+    tile_shape: 1
+  - !Temporal
+    rank_variable: m
+    tile_shape: 1
+  - !Compute
+    einsum: SpMSpM
+    component: MAC

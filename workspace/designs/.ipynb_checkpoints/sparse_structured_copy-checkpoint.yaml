@@ -1,0 +1,14 @@
+sparse_optimizations:
+  targets:
+  - target: DRAM
+    representation_format:
+    - {name: corpus_embeddings, format: csr, metadata_word_bits: 2}
+  - target: Buffer
+    representation_format:
+    - {name: corpus_embeddings, format: csr, metadata_word_bits: 2}
+    action_optimization:
+    - {kind: skipping, target: query_embedding, condition_on: [corpus_embeddings]}
+    - {kind: skipping, target: doc_scores, condition_on: [corpus_embeddings]}
+  - target: MAC
+    compute_optimization:
+    - {kind: skipping, target: doc_scores, condition_on: [corpus_embeddings]}
