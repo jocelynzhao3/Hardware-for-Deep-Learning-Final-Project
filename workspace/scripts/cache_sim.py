@@ -61,6 +61,20 @@ class CacheResult:
     miss_positions: list[int] = field(default_factory=list)
 
 
+@dataclass
+class TwoTierResult:
+    """Hit/miss accounting for an inclusive L1/L2 embedding cache."""
+
+    l1_hits: int
+    l2_hits: int
+    misses: int
+    total: int
+    l1_hit_rate: float
+    l2_hit_rate: float
+    overall_hit_rate: float
+    miss_positions: list[int] = field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # Trace generator
 # ---------------------------------------------------------------------------
@@ -271,6 +285,362 @@ def simulate_lfu_cost_aware(
         hits=hits,
         misses=misses,
         hit_rate=hits / n if n > 0 else 0.0,
+        miss_positions=miss_positions,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Policy 2b: Inclusive two-tier EdgeRAG LFU
+# ---------------------------------------------------------------------------
+
+def simulate_two_tier_lfu(
+    trace: list[int],
+    l1_capacity: int,
+    l2_capacity: int,
+    gen_latency: dict[int, float] | None = None,
+    decay_factor: float = 0.99,
+    check_invariants: bool = False,
+) -> TwoTierResult:
+    """Inclusive L1/L2 cache with EdgeRAG-style decayed LFU replacement.
+
+    This helper is generic and used by Experiment 2 for:
+      L1 = GlobalBuffer (SRAM cache), L2 = MainMemory (DRAM cache),
+      backing tier = Disk.
+
+    (In Experiment 3 it may also be used for LocalBuffer/GlobalBuffer.)
+
+    Inclusion invariant
+    -------------------
+    L1 is always a subset of L2.  On an L2 hit, the document is eagerly
+    promoted into L1.  On an L2 miss, the document is filled into both tiers.
+    L2 eviction avoids entries currently resident in L1; if L2 is full and
+    every L2 entry is also in L1, the simulator evicts one L1 entry first.
+
+    LFU policy
+    ----------
+    Both tiers share one lazily decayed access counter per document.  Eviction
+    priority is  gen_latency[doc] * effective_counter[doc], matching the
+    EdgeRAG cost-aware LFU form.  If all costs are uniform, this reduces to
+    decayed LFU.
+
+    Parameters
+    ----------
+    trace            : flat list of document IDs accessed in sequence
+    l1_capacity      : maximum number of embeddings in L1
+    l2_capacity      : maximum number of embeddings in L2
+    gen_latency      : per-document generation/loading latency; defaults to 1.0
+    decay_factor     : multiplicative decay applied lazily between accesses
+    check_invariants : if True, assert L1 <= L2 after every access
+    """
+    n = len(trace)
+    if n == 0:
+        return TwoTierResult(0, 0, 0, 0, 0.0, 0.0, 0.0, [])
+
+    if l2_capacity <= 0:
+        no_cache = simulate_no_cache(trace)
+        return TwoTierResult(
+            l1_hits=0,
+            l2_hits=0,
+            misses=no_cache.misses,
+            total=n,
+            l1_hit_rate=0.0,
+            l2_hit_rate=0.0,
+            overall_hit_rate=0.0,
+            miss_positions=no_cache.miss_positions,
+        )
+
+    l1_capacity = max(0, min(l1_capacity, l2_capacity))
+    gen_latency = gen_latency or {}
+
+    l1_cache: set[int] = set()
+    l2_cache: set[int] = set()
+
+    # Lazy-decay counters: doc -> (base_count, step_last_updated)
+    base_count: dict[int, float] = {}
+    last_step: dict[int, int] = {}
+
+    # Per-tier min-heaps with lazy deletion.
+    # Heap entry: (priority, generation_id, doc_id)
+    l1_heap: list[tuple[float, int, int]] = []
+    l2_heap: list[tuple[float, int, int]] = []
+    l1_heap_gen: dict[int, int] = {}
+    l2_heap_gen: dict[int, int] = {}
+    generation = [0]
+
+    def _effective_count(doc: int, step: int) -> float:
+        elapsed = step - last_step.get(doc, step)
+        return base_count.get(doc, 0.0) * (decay_factor ** elapsed)
+
+    def _priority(doc: int, step: int) -> float:
+        return gen_latency.get(doc, 1.0) * _effective_count(doc, step)
+
+    def _update_counter(doc: int, step: int) -> None:
+        base_count[doc] = _effective_count(doc, step) + 1.0
+        last_step[doc] = step
+
+    def _push(
+        heap: list[tuple[float, int, int]],
+        heap_gen: dict[int, int],
+        doc: int,
+        step: int,
+    ) -> None:
+        generation[0] += 1
+        gid = generation[0]
+        heap_gen[doc] = gid
+        heapq.heappush(heap, (_priority(doc, step), gid, doc))
+
+    def _evict_from_tier(
+        heap: list[tuple[float, int, int]],
+        heap_gen: dict[int, int],
+        cache: set[int],
+        forbidden: set[int],
+        step: int,
+    ) -> int | None:
+        """Evict the lowest-priority valid item not in `forbidden`."""
+        skipped_forbidden: list[int] = []
+        while heap:
+            priority, gid, doc = heapq.heappop(heap)
+            if doc not in cache or heap_gen.get(doc) != gid:
+                continue
+            if doc in forbidden:
+                skipped_forbidden.append(doc)
+                continue
+
+            cache.discard(doc)
+            heap_gen.pop(doc, None)
+            for skipped_doc in skipped_forbidden:
+                if skipped_doc in cache and heap_gen.get(skipped_doc) is not None:
+                    _push(heap, heap_gen, skipped_doc, step)
+            return doc
+        for skipped_doc in skipped_forbidden:
+            if skipped_doc in cache and heap_gen.get(skipped_doc) is not None:
+                _push(heap, heap_gen, skipped_doc, step)
+        return None
+
+    def _ensure_l1_room(step: int) -> None:
+        if l1_capacity <= 0:
+            return
+        if len(l1_cache) >= l1_capacity:
+            _evict_from_tier(l1_heap, l1_heap_gen, l1_cache, set(), step)
+
+    def _ensure_l2_room(step: int) -> None:
+        if len(l2_cache) < l2_capacity:
+            return
+
+        victim = _evict_from_tier(l2_heap, l2_heap_gen, l2_cache, l1_cache, step)
+        if victim is not None:
+            return
+
+        # Degenerate inclusive case: L1 and L2 are equally full, so there is no
+        # L2-only victim.  Evict from L1 first, then retry L2 eviction.
+        _evict_from_tier(l1_heap, l1_heap_gen, l1_cache, set(), step)
+        _evict_from_tier(l2_heap, l2_heap_gen, l2_cache, l1_cache, step)
+
+    def _promote_to_l1(doc: int, step: int) -> None:
+        if l1_capacity <= 0 or doc in l1_cache:
+            return
+        _ensure_l1_room(step)
+        l1_cache.add(doc)
+        _push(l1_heap, l1_heap_gen, doc, step)
+
+    l1_hits = 0
+    l2_hits = 0
+    misses = 0
+    miss_positions: list[int] = []
+
+    for step, doc in enumerate(trace):
+        if doc in l1_cache:
+            l1_hits += 1
+            _update_counter(doc, step)
+            _push(l1_heap, l1_heap_gen, doc, step)
+            _push(l2_heap, l2_heap_gen, doc, step)
+        elif doc in l2_cache:
+            l2_hits += 1
+            _update_counter(doc, step)
+            _push(l2_heap, l2_heap_gen, doc, step)
+            _promote_to_l1(doc, step)
+        else:
+            misses += 1
+            miss_positions.append(step)
+            _update_counter(doc, step)
+            _ensure_l2_room(step)
+            l2_cache.add(doc)
+            _push(l2_heap, l2_heap_gen, doc, step)
+            _promote_to_l1(doc, step)
+
+        if check_invariants:
+            assert l1_cache <= l2_cache
+            assert len(l1_cache) <= l1_capacity
+            assert len(l2_cache) <= l2_capacity
+
+    return TwoTierResult(
+        l1_hits=l1_hits,
+        l2_hits=l2_hits,
+        misses=misses,
+        total=n,
+        l1_hit_rate=l1_hits / n,
+        l2_hit_rate=l2_hits / n,
+        overall_hit_rate=(l1_hits + l2_hits) / n,
+        miss_positions=miss_positions,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Policy 2c: Inclusive two-tier Bélády OPT
+# ---------------------------------------------------------------------------
+
+def simulate_two_tier_opt(
+    trace: list[int],
+    l1_capacity: int,
+    l2_capacity: int,
+    check_invariants: bool = False,
+) -> TwoTierResult:
+    """Inclusive L1/L2 Bélády OPT with farthest-next-use eviction.
+
+    This is an offline upper bound for a two-tier inclusive hierarchy:
+      - L1 cache is a subset of L2 cache.
+      - On L2 hit, the item is promoted to L1.
+      - On miss, the item is inserted into L2 and then promoted to L1.
+      - L2 eviction prefers L2-only victims; if all L2 entries are also in L1,
+        one L1 victim is evicted first and then L2 eviction is retried.
+    """
+    n = len(trace)
+    if n == 0:
+        return TwoTierResult(0, 0, 0, 0, 0.0, 0.0, 0.0, [])
+
+    if l2_capacity <= 0:
+        no_cache = simulate_no_cache(trace)
+        return TwoTierResult(
+            l1_hits=0,
+            l2_hits=0,
+            misses=no_cache.misses,
+            total=n,
+            l1_hit_rate=0.0,
+            l2_hit_rate=0.0,
+            overall_hit_rate=0.0,
+            miss_positions=no_cache.miss_positions,
+        )
+
+    l1_capacity = max(0, min(l1_capacity, l2_capacity))
+
+    # Precompute access positions per document for O(1) next-use lookup.
+    pos_by_doc: dict[int, list[int]] = {}
+    for i, d in enumerate(trace):
+        pos_by_doc.setdefault(d, []).append(i)
+    pos_ptr: dict[int, int] = {d: 0 for d in pos_by_doc}
+
+    def _next_use(doc: int) -> int:
+        ptr = pos_ptr.get(doc, 0)
+        positions = pos_by_doc.get(doc, [])
+        nxt = ptr + 1
+        return positions[nxt] if nxt < len(positions) else n
+
+    l1_cache: set[int] = set()
+    l2_cache: set[int] = set()
+
+    # Max-heap emulation via negative next_use, with lazy deletion via versions.
+    l1_heap: list[tuple[int, int, int]] = []  # (-next_use, version, doc)
+    l2_heap: list[tuple[int, int, int]] = []
+    l1_ver: dict[int, int] = {}
+    l2_ver: dict[int, int] = {}
+    ver = [0]
+
+    def _push(
+        heap: list[tuple[int, int, int]],
+        versions: dict[int, int],
+        doc: int,
+    ) -> None:
+        ver[0] += 1
+        v = ver[0]
+        versions[doc] = v
+        heapq.heappush(heap, (-_next_use(doc), v, doc))
+
+    def _evict_farthest(
+        heap: list[tuple[int, int, int]],
+        versions: dict[int, int],
+        cache: set[int],
+        forbidden: set[int],
+    ) -> int | None:
+        skipped: list[int] = []
+        while heap:
+            _, v, doc = heapq.heappop(heap)
+            if doc not in cache or versions.get(doc) != v:
+                continue
+            if doc in forbidden:
+                skipped.append(doc)
+                continue
+            cache.discard(doc)
+            versions.pop(doc, None)
+            for d in skipped:
+                if d in cache and d in versions:
+                    _push(heap, versions, d)
+            return doc
+        for d in skipped:
+            if d in cache and d in versions:
+                _push(heap, versions, d)
+        return None
+
+    def _ensure_l1_room() -> None:
+        if l1_capacity <= 0:
+            return
+        if len(l1_cache) >= l1_capacity:
+            _evict_farthest(l1_heap, l1_ver, l1_cache, set())
+
+    def _ensure_l2_room() -> None:
+        if len(l2_cache) < l2_capacity:
+            return
+        victim = _evict_farthest(l2_heap, l2_ver, l2_cache, l1_cache)
+        if victim is not None:
+            return
+        # Degenerate inclusive case: all L2 entries are currently in L1.
+        _evict_farthest(l1_heap, l1_ver, l1_cache, set())
+        _evict_farthest(l2_heap, l2_ver, l2_cache, l1_cache)
+
+    def _promote_to_l1(doc: int) -> None:
+        if l1_capacity <= 0 or doc in l1_cache:
+            return
+        _ensure_l1_room()
+        l1_cache.add(doc)
+        _push(l1_heap, l1_ver, doc)
+
+    l1_hits = 0
+    l2_hits = 0
+    misses = 0
+    miss_positions: list[int] = []
+
+    for step, doc in enumerate(trace):
+        if doc in pos_ptr:
+            pos_ptr[doc] += 1
+
+        if doc in l1_cache:
+            l1_hits += 1
+            _push(l1_heap, l1_ver, doc)
+            _push(l2_heap, l2_ver, doc)
+        elif doc in l2_cache:
+            l2_hits += 1
+            _push(l2_heap, l2_ver, doc)
+            _promote_to_l1(doc)
+        else:
+            misses += 1
+            miss_positions.append(step)
+            _ensure_l2_room()
+            l2_cache.add(doc)
+            _push(l2_heap, l2_ver, doc)
+            _promote_to_l1(doc)
+
+        if check_invariants:
+            assert l1_cache <= l2_cache
+            assert len(l1_cache) <= l1_capacity
+            assert len(l2_cache) <= l2_capacity
+
+    return TwoTierResult(
+        l1_hits=l1_hits,
+        l2_hits=l2_hits,
+        misses=misses,
+        total=n,
+        l1_hit_rate=l1_hits / n,
+        l2_hit_rate=l2_hits / n,
+        overall_hit_rate=(l1_hits + l2_hits) / n,
         miss_positions=miss_positions,
     )
 
